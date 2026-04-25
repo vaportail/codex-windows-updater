@@ -1,0 +1,3 @@
+/target
+*.pdb
+/sync_dump.xml
