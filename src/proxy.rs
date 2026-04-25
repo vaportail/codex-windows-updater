@@ -182,6 +182,28 @@ fn kill_foreign_codex(holder: &SingletonHolder, versions_root: &Path) {
 #[cfg(not(windows))]
 fn kill_foreign_codex(_holder: &SingletonHolder, _versions_root: &Path) {}
 
+/// PIDs of every Codex-named process whose image is under `versions_root`
+/// (i.e. belongs to *this* install — main, renderers, GPU, utility, the
+/// lowercase CLI helper at `resources/codex.exe`, etc.). Used by the
+/// uninstaller to terminate only our processes, not foreign installs or
+/// unrelated `codex.exe` binaries.
+#[cfg(windows)]
+pub fn find_our_codex_pids(versions_root: &Path) -> Vec<u32> {
+    find_codex_pids()
+        .into_iter()
+        .filter(|&pid| {
+            process_image_path(pid)
+                .map(|img| img.starts_with(versions_root))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn find_our_codex_pids(_versions_root: &Path) -> Vec<u32> {
+    Vec::new()
+}
+
 /// Get the full image path for `pid`, or `None` if we can't query it.
 #[cfg(windows)]
 fn process_image_path(pid: u32) -> Option<PathBuf> {

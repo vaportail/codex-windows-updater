@@ -105,7 +105,10 @@ pub fn run_worker(ctx: UninstallContext, on_msg: impl Fn(UninstallMsg)) {
     }
 
     // --- 2. running-Codex prompt ------------------------------------------
-    let pids = proxy::find_codex_pids();
+    // Only consider Codex processes from *this* install. Foreign Codex
+    // installs and unrelated `codex.exe` binaries are left alone.
+    let versions_root = root.join("versions");
+    let pids = proxy::find_our_codex_pids(&versions_root);
     if !pids.is_empty() {
         let msg = format!(
             "Codex is currently running ({} process{}).\n\n\
@@ -125,7 +128,7 @@ pub fn run_worker(ctx: UninstallContext, on_msg: impl Fn(UninstallMsg)) {
             detail: format!("{} process(es)", pids.len()),
         });
         proxy::terminate_pids(&pids, 5000);
-        let still = proxy::find_codex_pids();
+        let still = proxy::find_our_codex_pids(&versions_root);
         if !still.is_empty() {
             on_msg(UninstallMsg::Error(format!(
                 "Failed to terminate {} Codex process(es). Aborting — no files modified.",

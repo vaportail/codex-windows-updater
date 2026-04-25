@@ -9,14 +9,18 @@
 //!    spin like `rmdir /s /q` did.
 //!
 //! 2. `delete_self_exe` — tiered self-delete of the running launcher.
-//!    Tier (a): POSIX semantics (Win10 1809+) via `SetFileInformationByHandle`
-//!    with `FileDispositionInfoEx` + `FILE_DISPOSITION_POSIX_SEMANTICS`.
-//!    Unlinks immediately while we still execute; data vanishes when the
-//!    loader's handle closes on process exit. No admin, no reboot.
-//!    Tier (b): `MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)` — needs admin
+//!    Tier (a): POSIX semantics (Win10 1809+, NTFS) via
+//!    `SetFileInformationByHandle` with `FileDispositionInfoEx` +
+//!    `FILE_DISPOSITION_POSIX_SEMANTICS`. Unlinks immediately while we
+//!    still execute; data vanishes when the loader's handle closes on
+//!    process exit. No admin, no reboot.
+//!    Tier (b): detached `cmd.exe` retry-deleter. Loops `del` for up to
+//!    ~30 seconds until our process exits and the filesystem releases the
+//!    loader handle. No admin, no special filesystem requirement.
+//!    Tier (c): `MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)` — needs admin
 //!    (writes HKLM's PendingFileRenameOperations). smss.exe processes the
 //!    queue at next boot.
-//!    Tier (c): give up — return `LeftBehind`; caller logs it.
+//!    Tier (d): give up — return `LeftBehind`; caller logs it.
 //!
 //! 3. `CleanupReport` — per-path deleted/skipped record, plus the
 //!    self-delete outcome. Caller writes this to a log file.
@@ -47,9 +51,12 @@ pub struct CleanupReport {
 pub enum SelfDeleteOutcome {
     /// POSIX unlink succeeded — file is already gone, handle still valid until exit.
     PosixUnlinked,
+    /// A detached `cmd.exe` cleanup helper has been spawned. It loops trying
+    /// to delete our exe (waiting for our process to exit) and self-exits.
+    SpawnedCleanup,
     /// Scheduled for delete at next boot via PendingFileRenameOperations.
     ScheduledForReboot,
-    /// Couldn't delete by either mechanism. Exe will linger; user must clean manually.
+    /// Couldn't delete by any mechanism. Exe will linger; user must clean manually.
     LeftBehind(String),
 }
 
@@ -57,6 +64,7 @@ impl std::fmt::Display for SelfDeleteOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SelfDeleteOutcome::PosixUnlinked => f.write_str("PosixUnlinked"),
+            SelfDeleteOutcome::SpawnedCleanup => f.write_str("SpawnedCleanup"),
             SelfDeleteOutcome::ScheduledForReboot => f.write_str("ScheduledForReboot"),
             SelfDeleteOutcome::LeftBehind(reason) => write!(f, "LeftBehind ({reason})"),
         }
@@ -197,7 +205,12 @@ fn is_not_empty(e: &std::io::Error) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Self-delete: POSIX unlink (Win10 1809+) with MoveFileEx-on-reboot fallback.
+// Self-delete tiers (in order, fall through on failure):
+//   1. POSIX unlink (Win10 1809+, NTFS). No admin, vanishes on process exit.
+//   2. Detached `cmd.exe` helper that retry-deletes us after our exit.
+//      No admin, no special filesystem requirements; works back to XP.
+//   3. MoveFileEx delay-until-reboot. Needs admin (writes HKLM).
+//   4. Give up; report LeftBehind.
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -208,18 +221,52 @@ pub fn delete_self_exe() -> SelfDeleteOutcome {
     };
 
     // Tier 1: POSIX unlink.
-    match posix_unlink_self(&exe) {
-        Ok(()) => return SelfDeleteOutcome::PosixUnlinked,
-        Err(e) => {
-            eprintln!("posix self-delete failed: {e}; falling back to reboot-delete");
-        }
+    if let Err(e) = posix_unlink_self(&exe) {
+        eprintln!("posix self-delete failed: {e}; trying detached cleanup helper");
+    } else {
+        return SelfDeleteOutcome::PosixUnlinked;
     }
 
-    // Tier 2: MoveFileEx delay-until-reboot. Needs admin.
+    // Tier 2: detached cmd.exe retry-delete. Loops until our process exits
+    // and the filesystem releases the loader handle, or until the retry
+    // budget expires.
+    if let Err(e) = spawn_cmd_self_delete(&exe) {
+        eprintln!("cmd cleanup helper failed: {e}; falling back to reboot-delete");
+    } else {
+        return SelfDeleteOutcome::SpawnedCleanup;
+    }
+
+    // Tier 3: MoveFileEx delay-until-reboot. Needs admin.
     match schedule_reboot_delete(&exe) {
         Ok(()) => SelfDeleteOutcome::ScheduledForReboot,
         Err(e) => SelfDeleteOutcome::LeftBehind(format!("reboot-delete failed: {e}")),
     }
+}
+
+/// Spawn a detached `cmd.exe` that retries deleting `exe` until it
+/// succeeds or hits the iteration cap (~30 attempts × 1s ≈ 30 seconds).
+/// Each iteration: try `del`, check if file is gone, sleep ~1s, retry.
+/// First attempt happens immediately so if our process exits quickly the
+/// file goes away on the first try.
+#[cfg(windows)]
+fn spawn_cmd_self_delete(exe: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+    let exe_q = format!("\"{}\"", exe.display());
+    // FOR /L iterates 1..=30. Each pass attempts del (silently swallowing
+    // errors), then exits if the file is gone, otherwise sleeps ~1s via
+    // ping (more portable than `timeout` in non-interactive contexts).
+    let cmd_line = format!(
+        "for /L %i in (1,1,30) do (del /f /q {exe_q} 2>nul & if not exist {exe_q} exit & ping -n 2 127.0.0.1 >nul)"
+    );
+
+    std::process::Command::new("cmd.exe")
+        .args(["/c", &cmd_line])
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()?;
+    Ok(())
 }
 
 #[cfg(windows)]
