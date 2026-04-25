@@ -30,7 +30,36 @@ Install layout:
 Not affiliated with OpenAI or Microsoft. The Codex app, its branding, and
 its packaging belong to OpenAI.
 
-## Building
+## Download
+
+Latest release:
+[**codex-launcher.exe**](https://github.com/vaportail/codex-windows-updater/releases/latest/download/codex-launcher.exe)
+([SHA-256](https://github.com/vaportail/codex-windows-updater/releases/latest/download/codex-launcher.exe.sha256))
+
+Run the binary — it'll launch the installer wizard.
+
+> Windows SmartScreen will warn on first run because the binary isn't
+> signed (see [License](#license)). Click "More info" → "Run anyway."
+
+### Verifying the build
+
+Each release is built by GitHub Actions and signed via Sigstore
+build-provenance. To verify the binary you downloaded was produced by
+this exact repo at the tagged commit (requires
+[GitHub CLI](https://cli.github.com/)):
+
+```
+gh attestation verify codex-launcher.exe --owner vaportail
+```
+
+For a basic integrity check without `gh`, compare the SHA-256:
+
+```powershell
+(Get-FileHash codex-launcher.exe -Algorithm SHA256).Hash
+# compare against the contents of codex-launcher.exe.sha256
+```
+
+## Building from source
 
 Requires Rust 1.80+ and the MSVC toolchain on Windows.
 
@@ -172,3 +201,8 @@ their own license terms:
 If you redistribute the compiled launcher, comply with all of the above —
 chiefly: keep the "Made with Slint" attribution visible, and preserve
 upstream license notices.
+
+---
+
+Most of this code was written with Anthropic's Claude. Yes, the irony of
+shipping a Codex launcher built by a competing AI is fully appreciated.
