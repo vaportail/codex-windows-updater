@@ -209,6 +209,17 @@ fn whitelist_delete(root: &Path, report: &mut CleanupReport, on_msg: &impl Fn(Un
         Ok(()) => report.deleted.push(cfg),
         Err(e) => report.skipped.push((cfg, format!("{e}"))),
     }
+
+    // Per-user runtime-state fallback — only ours. Match on embedded
+    // install_root so we don't wipe another install's state. launcher.log
+    // in the same dir is left for post-uninstall diagnostics.
+    match crate::config::clear_state_file_if_ours(root) {
+        Ok(Some(p)) => report.deleted.push(p),
+        Ok(None) => {}
+        Err(e) => report
+            .skipped
+            .push((std::path::PathBuf::from("state.json"), format!("{e}"))),
+    }
 }
 
 fn write_report(root: &Path, report: &CleanupReport) -> Result<PathBuf> {

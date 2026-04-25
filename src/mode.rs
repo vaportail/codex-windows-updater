@@ -24,7 +24,10 @@ pub fn detect() -> anyhow::Result<Mode> {
     if !path.exists() {
         return Ok(Mode::Installer);
     }
-    match Config::load(&path) {
+    // Use load_runtime so System installs (whose install-root config may
+    // be frozen at install time) still pick up runtime state from the
+    // per-user fallback file when present.
+    match Config::load_runtime(&dir) {
         Ok(cfg) => Ok(Mode::Proxy(cfg)),
         Err(_) => Ok(Mode::Installer),
     }
@@ -44,10 +47,6 @@ fn migrate_legacy_config(dir: &Path) {
     if Config::load(&old_path).is_ok() {
         let _ = std::fs::rename(&old_path, &new_path);
     }
-}
-
-pub fn config_path() -> anyhow::Result<PathBuf> {
-    Ok(install_root()?.join(CONFIG_FILENAME))
 }
 
 pub fn install_root() -> anyhow::Result<PathBuf> {
