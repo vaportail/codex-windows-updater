@@ -18,6 +18,7 @@ use crate::extract;
 use crate::junction;
 use crate::registry;
 use crate::shortcut;
+use crate::signature;
 use crate::store::{self, Fetcher};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -111,6 +112,14 @@ fn update_inner(root: &Path, on_msg: &dyn Fn(InstallMsg)) -> Result<String> {
         &downloads,
         &mut |done, total| boxed.progress_bytes(done, total),
     )?;
+
+    on_msg(InstallMsg::Phase {
+        phase: "Verifying signature".into(),
+        detail: format!("version {}", result.version),
+    });
+    on_msg(InstallMsg::Progress(None));
+    signature::verify_msix(&result.msix_path)
+        .context("MSIX signature verification failed; refusing to extract")?;
 
     on_msg(InstallMsg::Phase {
         phase: "Extracting".into(),
@@ -219,7 +228,16 @@ fn run_inner(opts: &InstallOptions, on_msg: &dyn Fn(InstallMsg)) -> Result<Strin
         }
     };
 
-    // --- 2. Extract ---------------------------------------------------------
+    // --- 2. Verify Authenticode signature ----------------------------------
+    on_msg(InstallMsg::Phase {
+        phase: "Verifying signature".into(),
+        detail: format!("version {}", result.version),
+    });
+    on_msg(InstallMsg::Progress(None));
+    signature::verify_msix(&result.msix_path)
+        .context("MSIX signature verification failed; refusing to extract")?;
+
+    // --- 3. Extract ---------------------------------------------------------
     on_msg(InstallMsg::Phase {
         phase: "Extracting".into(),
         detail: format!("version {}", result.version),

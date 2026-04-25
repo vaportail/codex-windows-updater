@@ -39,6 +39,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
 ]}
 
 [build-dependencies]

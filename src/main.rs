@@ -17,6 +17,7 @@ mod proxy;
 mod registry;
 mod safety;
 mod shortcut;
+mod signature;
 mod splash;
 mod store;
 mod uninstall;
@@ -45,6 +46,11 @@ fn main() -> anyhow::Result<()> {
     if args.iter().any(|a| a == "--self-test") {
         return Ok(());
     }
+
+    // Capture panics to the per-user log so GUI-subsystem builds (where
+    // `eprintln!` is a no-op) leave a forensic trail. Only installs after
+    // `--self-test` so the smoke-test path stays side-effect-free.
+    install_panic_handler();
 
     // Best-effort cleanup of a half-written `codex-launcher.new.exe` from a
     // prior interrupted self-update. `codex-launcher.old.exe` is preserved
@@ -257,7 +263,7 @@ fn run_proxy(
                     ui.set_update_latest_version(latest.into());
                     ui.set_current_screen(12);
                     drop(splash);
-                    let _ = ui.show();
+                    show_dark(&ui);
                 }
                 other => {
                     if let UpdateDecision::Error(e) = &other {
@@ -277,7 +283,7 @@ fn run_proxy(
                     // until the user dismisses. Otherwise quit.
                     if !ui.get_launcher_release_url().is_empty() {
                         ui.set_current_screen(30);
-                        let _ = ui.show();
+                        show_dark(&ui);
                     } else {
                         let _ = slint::quit_event_loop();
                     }
@@ -1104,18 +1110,25 @@ fn prepare_window(ui: &AppWindow) {
         let y = ((screen_h - win_h) / 2).max(0);
         ui.window().set_position(slint::PhysicalPosition::new(x, y));
     }
+    dark_window::hide_cover_after_first_render(ui);
     let _ = ui.window().hide();
 }
 
-/// Schedule `ui.show()` once the event loop runs, so Slint's renderer has
-/// time to produce a first frame before the window becomes visible.
+/// Schedule the first show once the event loop runs. `show_dark` places a
+/// native black cover over the future Slint bounds so any platform first-frame
+/// flash is black instead of white.
 fn show_when_ready(ui: &AppWindow) {
     let weak = ui.as_weak();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
-            let _ = ui.show();
+            show_dark(&ui);
         }
     });
+}
+
+fn show_dark(ui: &AppWindow) {
+    dark_window::show_cover(ui);
+    let _ = ui.show();
 }
 
 /// If any app-shell processes from *this* install are running, prompt the
@@ -1404,6 +1417,32 @@ fn launcher_log_display() -> String {
     launcher_log_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| LAUNCHER_LOG_PATH_FALLBACK.to_string())
+}
+
+/// Route panics through `log_event` so a crash in the GUI-subsystem build
+/// still leaves something for a user to send back. `panic = "abort"` means
+/// the process dies right after the hook runs — but the hook *does* run
+/// before the abort, so the log line lands. Backtraces are forced on
+/// regardless of `RUST_BACKTRACE` because end users won't have set it.
+fn install_panic_handler() {
+    let prior = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let bt = std::backtrace::Backtrace::force_capture();
+        log_event(&format!("PANIC at {location}: {msg}\nbacktrace:\n{bt}"));
+        prior(info);
+    }));
 }
 
 /// Append a single timestamped line to the per-user launcher log. Used to
