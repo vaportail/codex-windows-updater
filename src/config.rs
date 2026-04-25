@@ -76,6 +76,20 @@ pub struct Config {
     /// Off by default for Portable installs.
     #[serde(default = "default_true")]
     pub register_uninstall: bool,
+    /// Last GitHub release tag we observed for the launcher itself
+    /// (this project, not Codex). Compared against `CARGO_PKG_VERSION`
+    /// at runtime to detect when a newer launcher is available.
+    #[serde(default)]
+    pub known_latest_launcher: Option<String>,
+    /// Specific launcher version the user chose "Skip this version" for.
+    /// Suppresses the launcher prompt only as long as the GitHub release's
+    /// latest tag equals this — newer releases re-prompt.
+    #[serde(default)]
+    pub skipped_launcher_version: Option<String>,
+    /// Snooze for the launcher prompt only (independent of `suppress_until_unix`,
+    /// which suppresses the *Codex* prompt). Set to `u64::MAX` for "Never".
+    #[serde(default)]
+    pub launcher_suppress_until_unix: Option<u64>,
 }
 
 fn default_keep_versions() -> u32 {

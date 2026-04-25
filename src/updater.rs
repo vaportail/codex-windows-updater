@@ -19,6 +19,12 @@ use crate::config::{Config, UpdatePolicy};
 use crate::store::{self, Fetcher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Owner/repo for the launcher's own GitHub releases. Tweak here if the
+/// project ever moves.
+pub const LAUNCHER_REPO: &str = "vaportail/codex-windows-updater";
+pub const LAUNCHER_LATEST_API: &str =
+    "https://api.github.com/repos/vaportail/codex-windows-updater/releases/latest";
+
 #[derive(Debug, Clone)]
 pub enum UpdateDecision {
     /// Skip the check entirely (policy=Never, suppressed, or policy cooldown).
@@ -137,6 +143,174 @@ pub fn apply_defer(cfg: &mut Config, choice: DeferChoice, latest: &str) {
 pub fn record_check(cfg: &mut Config, latest: &str) {
     cfg.last_check_unix = Some(now_unix());
     cfg.known_latest = Some(latest.to_string());
+}
+
+// -- Launcher self-update check -------------------------------------------
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Skipped/Error fields are reserved for future logging.
+pub enum LauncherDecision {
+    /// Skipped (policy=Never, snoozed, within cooldown, or skip-this-version match).
+    Skipped { reason: String },
+    /// We're on the latest tag.
+    UpToDate { version: String },
+    /// A newer tag is published. `release_url` is the GitHub Releases page.
+    Available {
+        current: String,
+        latest: String,
+        release_url: String,
+    },
+    /// API call or parse failed. Surface but don't block.
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherDeferChoice {
+    /// Open the release page in the user's default browser. Doesn't dismiss.
+    ViewRelease,
+    /// Defer until next cooldown roll.
+    NotNow,
+    /// Suppress prompts only while GitHub's latest equals this version.
+    SkipThisVersion,
+    SnoozeOneDay,
+    SnoozeSevenDays,
+    /// Suppress launcher prompts effectively forever (suppress_until = u64::MAX).
+    Never,
+}
+
+/// Reconstruct a pending launcher prompt from persisted state — no network.
+/// Used by paths that can't re-run the bg check (e.g. elevated `--auto-update`
+/// re-spawn — the unelevated process already bumped the shared cooldown).
+/// Returns `Some` only if `known_latest_launcher` is newer than the running
+/// version and the user hasn't silenced it (skip / snooze / never).
+pub fn pending_launcher_from_state(cfg: &Config) -> Option<LauncherDecision> {
+    if cfg.update_policy == UpdatePolicy::Never {
+        return None;
+    }
+    if let Some(until) = cfg.launcher_suppress_until_unix {
+        if now_unix() < until {
+            return None;
+        }
+    }
+    let latest = cfg.known_latest_launcher.as_ref()?;
+    if cfg.skipped_launcher_version.as_deref() == Some(latest.as_str()) {
+        return None;
+    }
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    if !version_gt(latest, &current) {
+        return None;
+    }
+    Some(LauncherDecision::Available {
+        current,
+        latest: latest.clone(),
+        release_url: format!("https://github.com/{LAUNCHER_REPO}/releases/tag/v{latest}"),
+    })
+}
+
+/// Automatic launcher-update check. Honors the shared `update_policy` and
+/// `last_check_unix` cooldown, plus launcher-specific snooze and
+/// skip-this-version. Doesn't itself update `last_check_unix` — caller is
+/// expected to record after both checks complete.
+pub fn check_launcher_auto(cfg: &Config) -> LauncherDecision {
+    let now = now_unix();
+    if cfg.update_policy == UpdatePolicy::Never {
+        return LauncherDecision::Skipped {
+            reason: "update_policy = never".into(),
+        };
+    }
+    if let Some(until) = cfg.launcher_suppress_until_unix {
+        if now < until {
+            let days = (until - now) / 86_400;
+            return LauncherDecision::Skipped {
+                reason: format!("launcher prompt suppressed for ~{days}d"),
+            };
+        }
+    }
+    if let Some(last) = cfg.last_check_unix {
+        let cooldown = policy_cooldown_secs(cfg.update_policy);
+        if now.saturating_sub(last) < cooldown {
+            return LauncherDecision::Skipped {
+                reason: "within cooldown".into(),
+            };
+        }
+    }
+
+    let decision = check_launcher_now();
+    if let LauncherDecision::Available { latest, .. } = &decision {
+        if cfg.skipped_launcher_version.as_deref() == Some(latest.as_str()) {
+            return LauncherDecision::Skipped {
+                reason: format!("launcher version {latest} skipped by user"),
+            };
+        }
+    }
+    decision
+}
+
+/// Force a launcher-update check regardless of policy/snooze/cooldown.
+pub fn check_launcher_now() -> LauncherDecision {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    match fetch_latest_launcher_tag() {
+        Ok(tag) => {
+            // Strip "v" prefix if present (we tag releases as v0.1.0 but
+            // CARGO_PKG_VERSION is plain 0.1.0).
+            let latest_ver = tag.trim_start_matches('v').to_string();
+            if version_gt(&latest_ver, &current) {
+                LauncherDecision::Available {
+                    current,
+                    latest: latest_ver,
+                    release_url: format!("https://github.com/{LAUNCHER_REPO}/releases/tag/{tag}"),
+                }
+            } else {
+                LauncherDecision::UpToDate {
+                    version: latest_ver,
+                }
+            }
+        }
+        Err(e) => LauncherDecision::Error(format!("{e:#}")),
+    }
+}
+
+fn fetch_latest_launcher_tag() -> anyhow::Result<String> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct LatestRelease {
+        tag_name: String,
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("codex-windows-updater/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let resp = client
+        .get(LAUNCHER_LATEST_API)
+        .header("Accept", "application/vnd.github+json")
+        .send()?
+        .error_for_status()?;
+    let body: LatestRelease = resp.json()?;
+    Ok(body.tag_name)
+}
+
+/// Apply a launcher defer choice. Caller persists.
+pub fn apply_launcher_defer(cfg: &mut Config, choice: LauncherDeferChoice, latest: &str) {
+    let now = now_unix();
+    cfg.known_latest_launcher = Some(latest.to_string());
+    match choice {
+        LauncherDeferChoice::ViewRelease | LauncherDeferChoice::NotNow => {
+            // No state change beyond known_latest_launcher. Cooldown
+            // governs next prompt.
+        }
+        LauncherDeferChoice::SkipThisVersion => {
+            cfg.skipped_launcher_version = Some(latest.to_string());
+        }
+        LauncherDeferChoice::SnoozeOneDay => {
+            cfg.launcher_suppress_until_unix = Some(now + 86_400);
+        }
+        LauncherDeferChoice::SnoozeSevenDays => {
+            cfg.launcher_suppress_until_unix = Some(now + 7 * 86_400);
+        }
+        LauncherDeferChoice::Never => {
+            cfg.launcher_suppress_until_unix = Some(u64::MAX);
+        }
+    }
 }
 
 fn policy_cooldown_secs(p: UpdatePolicy) -> u64 {

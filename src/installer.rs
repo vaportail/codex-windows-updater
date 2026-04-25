@@ -254,6 +254,9 @@ fn run_inner(opts: &InstallOptions, on_msg: &dyn Fn(InstallMsg)) -> Result<Strin
         },
         use_current_junction: opts.use_current_junction,
         register_uninstall: opts.register_uninstall,
+        known_latest_launcher: None,
+        skipped_launcher_version: None,
+        launcher_suppress_until_unix: None,
     };
     cfg.save(&opts.root.join(CONFIG_FILENAME))?;
 

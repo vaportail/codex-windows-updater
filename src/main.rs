@@ -132,8 +132,21 @@ fn run_proxy(
 
         let ui = AppWindow::new()?;
         center_window(&ui);
-        let cfg_shared = Arc::new(Mutex::new(cfg.clone()));
-        wire_proxy_ui(&ui, cfg, fetcher_override, None, root.clone(), forward)?;
+        // The unelevated bg check persisted launcher state then bumped the
+        // shared cooldown — this re-spawn can't redo the check, so recover
+        // the pending prompt from disk so on_request_launch can chain to
+        // screen 30 after the update finishes.
+        if let Some(updater::LauncherDecision::Available {
+            current,
+            latest,
+            release_url,
+        }) = updater::pending_launcher_from_state(&cfg)
+        {
+            ui.set_launcher_current_version(current.into());
+            ui.set_launcher_latest_version(latest.into());
+            ui.set_launcher_release_url(release_url.into());
+        }
+        let cfg_shared = wire_proxy_ui(&ui, cfg, fetcher_override, None, root.clone(), forward)?;
         ui.set_current_screen(4);
         ui.set_progress_phase("Starting update".into());
         ui.set_progress_detail("".into());
@@ -152,7 +165,9 @@ fn run_proxy(
     let ui = AppWindow::new()?;
     center_window(&ui);
     let cfg_for_launch = cfg.clone();
-    wire_proxy_ui(
+    // Bg thread writes `cfg_to_launch` into this shared Arc — without it,
+    // a launcher-defer save would clobber the just-recorded Codex state.
+    let cfg_shared = wire_proxy_ui(
         &ui,
         cfg,
         fetcher_override,
@@ -168,24 +183,18 @@ fn run_proxy(
 
     let ui_weak = ui.as_weak();
     let splash_start = std::time::Instant::now();
+    let cfg_shared_for_bg = cfg_shared.clone();
     std::thread::spawn(move || {
-        let decision = updater::check_auto(&cfg_for_check, store::PRODUCT_ID_CODEX);
+        let codex_decision = updater::check_auto(&cfg_for_check, store::PRODUCT_ID_CODEX);
+        // Run the launcher check against the same cfg snapshot so both
+        // checks see the same `last_check_unix` and either both fire (when
+        // cooldown elapsed) or both skip.
+        let launcher_decision = updater::check_launcher_auto(&cfg_for_check);
 
-        // Persist last_check / known_latest if we got a real answer.
-        let cfg_to_launch = match &decision {
-            UpdateDecision::UpToDate { version }
-            | UpdateDecision::Available {
-                latest: version, ..
-            } => {
-                let mut c = cfg_for_launch.clone();
-                updater::record_check(&mut c, version);
-                if let Ok(path) = mode::config_path() {
-                    let _ = c.save(&path);
-                }
-                c
-            }
-            _ => cfg_for_launch.clone(),
-        };
+        let cfg_to_launch =
+            persist_runtime_state(&cfg_for_launch, &codex_decision, &launcher_decision);
+        // Sync into the shared Mutex so UI callbacks save from current state.
+        *cfg_shared_for_bg.lock().unwrap() = cfg_to_launch.clone();
 
         #[allow(clippy::absurd_extreme_comparisons)]
         {
@@ -199,18 +208,33 @@ fn run_proxy(
 
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            match decision {
+
+            // Stash the launcher-update info on the UI regardless of what
+            // we're about to display — the defer-Codex callback later
+            // checks `launcher-release-url` to decide whether to chain into
+            // screen 30 or just quit.
+            if let updater::LauncherDecision::Available {
+                current,
+                latest,
+                release_url,
+            } = &launcher_decision
+            {
+                ui.set_launcher_current_version(current.clone().into());
+                ui.set_launcher_latest_version(latest.clone().into());
+                ui.set_launcher_release_url(release_url.clone().into());
+            }
+
+            match codex_decision {
                 UpdateDecision::Available { current, latest } => {
+                    // Codex prompt gates Codex spawn. Chaining into screen 30
+                    // (when launcher update is also pending) happens in the
+                    // on_request_update defer path, not here.
                     ui.set_update_current_version(current.into());
                     ui.set_update_latest_version(latest.into());
                     ui.set_current_screen(12);
                     let _ = ui.show();
                 }
                 other => {
-                    // Only log unexpected paths: a failed check (network/etc.)
-                    // is diagnostic-worthy; "skipped within cooldown" and
-                    // successful spawns are normal flow and would just create
-                    // noise.
                     if let UpdateDecision::Error(e) = &other {
                         log_event(&format!("update check failed: {e}; launching anyway"));
                     }
@@ -222,7 +246,15 @@ fn run_proxy(
                             launcher_log_display()
                         ));
                     }
-                    let _ = slint::quit_event_loop();
+                    // Codex spawned (or errored). If a launcher update is
+                    // available, surface it now and keep the window open
+                    // until the user dismisses. Otherwise quit.
+                    if !ui.get_launcher_release_url().is_empty() {
+                        ui.set_current_screen(30);
+                        let _ = ui.show();
+                    } else {
+                        let _ = slint::quit_event_loop();
+                    }
                 }
             }
         });
@@ -444,6 +476,9 @@ fn wire_installer_ui(
                 fetcher: int_to_fetcher(ui.get_fetcher()),
                 use_current_junction: use_junction,
                 register_uninstall: ui.get_register_uninstall(),
+                known_latest_launcher: None,
+                skipped_launcher_version: None,
+                launcher_suppress_until_unix: None,
             };
             if let Err(e) = proxy::launch(&root, &cfg, &[]) {
                 let msg = format!("post-install launch failed: {e:#}");
@@ -627,7 +662,7 @@ fn wire_proxy_ui(
     initial_decision: Option<UpdateDecision>,
     root: std::path::PathBuf,
     forward_args: Vec<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<Mutex<Config>>> {
     // Seed proxy status screen (shown as return screen after "not now"/snooze
     // and as the anchor for the "Check for updates" button).
     let effective_fetcher = fetcher_override.unwrap_or(cfg.fetcher);
@@ -738,17 +773,54 @@ fn wire_proxy_ui(
 
             // If the user reached this prompt via the proxy-startup
             // launch-intent flow, fulfill the original intent: launch the
-            // currently installed Codex and exit. Otherwise (explicit
-            // "Check for updates"), fall back to the proxy status screen.
+            // currently installed Codex. Then either chain into the
+            // launcher-update prompt (if one was pending) or exit.
+            // Otherwise (explicit "Check for updates"), fall back to the
+            // proxy status screen.
             if pending_launch.swap(false, Ordering::SeqCst) {
                 if let Err(e) = proxy::launch(&root, &cfg_snapshot, &forward_args) {
                     eprintln!("launch failed: {e:#}");
                 }
-                let _ = ui.window().hide();
-                let _ = slint::quit_event_loop();
+                if !ui.get_launcher_release_url().is_empty() {
+                    ui.set_current_screen(30);
+                } else {
+                    let _ = ui.window().hide();
+                    let _ = slint::quit_event_loop();
+                }
                 return;
             }
             ui.set_current_screen(10);
+        });
+    }
+
+    // Launcher self-update prompt callback (screen 30).
+    {
+        let ui_weak = ui.as_weak();
+        let cfg = cfg.clone();
+        ui.on_request_launcher_action(move |action_idx| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let action = int_to_launcher_choice(action_idx);
+
+            if action == updater::LauncherDeferChoice::ViewRelease {
+                let url = ui.get_launcher_release_url().to_string();
+                if !url.is_empty() {
+                    open_url(&url);
+                }
+                // Don't dismiss; user may also pick a defer option after.
+                return;
+            }
+
+            let latest = ui.get_launcher_latest_version().to_string();
+            {
+                let mut c = cfg.lock().unwrap();
+                updater::apply_launcher_defer(&mut c, action, &latest);
+                if let Ok(path) = mode::config_path() {
+                    let _ = c.save(&path);
+                }
+            }
+
+            let _ = ui.window().hide();
+            let _ = slint::quit_event_loop();
         });
     }
 
@@ -772,12 +844,18 @@ fn wire_proxy_ui(
                 eprintln!("launch failed: {e:#}");
             }
             if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.window().hide();
+                // Surface pending launcher prompt before exit — otherwise
+                // user wouldn't see it again until next cooldown.
+                if !ui.get_launcher_release_url().is_empty() {
+                    ui.set_current_screen(30);
+                } else {
+                    let _ = ui.window().hide();
+                }
             }
         });
     }
 
-    Ok(())
+    Ok(cfg)
 }
 
 fn spawn_force_check(ui_weak: slint::Weak<AppWindow>, cfg: Arc<Mutex<Config>>) {
@@ -937,6 +1015,83 @@ fn int_to_defer_choice(i: i32) -> DeferChoice {
         5 => DeferChoice::Never,
         _ => DeferChoice::NotNow,
     }
+}
+
+fn int_to_launcher_choice(i: i32) -> updater::LauncherDeferChoice {
+    use updater::LauncherDeferChoice as L;
+    match i {
+        0 => L::ViewRelease,
+        1 => L::NotNow,
+        2 => L::SkipThisVersion,
+        3 => L::SnoozeOneDay,
+        4 => L::SnoozeSevenDays,
+        5 => L::Never,
+        _ => L::NotNow,
+    }
+}
+
+/// Open `url` in the user's default browser via `ShellExecuteW`. Best-effort;
+/// failures (typically nothing registered for http) are swallowed.
+fn open_url(url: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = ShellExecuteW(
+            HWND::default(),
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(url_w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// Apply both check decisions to a fresh Config snapshot and persist it.
+/// Only a successful Codex check bumps `last_check_unix` — that timestamp
+/// gates the shared cooldown, so a launcher-only success must not advance
+/// it (would suppress Codex retry after a Store failure). Returns the
+/// updated Config; caller syncs it into the shared `Arc<Mutex<Config>>`.
+fn persist_runtime_state(
+    base: &Config,
+    codex: &UpdateDecision,
+    launcher: &updater::LauncherDecision,
+) -> Config {
+    let mut c = base.clone();
+    let mut changed = false;
+    match codex {
+        UpdateDecision::UpToDate { version }
+        | UpdateDecision::Available {
+            latest: version, ..
+        } => {
+            updater::record_check(&mut c, version);
+            changed = true;
+        }
+        _ => {}
+    }
+    match launcher {
+        updater::LauncherDecision::UpToDate { version }
+        | updater::LauncherDecision::Available {
+            latest: version, ..
+        } => {
+            c.known_latest_launcher = Some(version.clone());
+            // Do NOT bump last_check_unix — see fn doc. GitHub call is
+            // cheap; happy to re-run it alongside the next Codex retry.
+            changed = true;
+        }
+        _ => {}
+    }
+    if changed {
+        if let Ok(path) = mode::config_path() {
+            let _ = c.save(&path);
+        }
+    }
+    c
 }
 
 fn apply_install_msg(ui: &AppWindow, msg: InstallMsg) {
