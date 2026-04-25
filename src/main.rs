@@ -207,25 +207,20 @@ fn run_proxy(
                     let _ = ui.show();
                 }
                 other => {
-                    if let UpdateDecision::Skipped { reason } = &other {
-                        log_event(&root, &format!("update check skipped: {reason}"));
-                    }
+                    // Only log unexpected paths: a failed check (network/etc.)
+                    // is diagnostic-worthy; "skipped within cooldown" and
+                    // successful spawns are normal flow and would just create
+                    // noise.
                     if let UpdateDecision::Error(e) = &other {
-                        log_event(
-                            &root,
-                            &format!("update check failed: {e}; launching anyway"),
-                        );
+                        log_event(&format!("update check failed: {e}; launching anyway"));
                     }
-                    match proxy::launch(&root, &cfg_to_launch, &forward) {
-                        Ok(()) => log_event(&root, "spawned Codex"),
-                        Err(e) => {
-                            let msg = format!("launch failed: {e:#}");
-                            log_event(&root, &msg);
-                            dialogs::error(&format!(
-                                "Could not launch Codex.\n\n{msg}\n\nLog: {}\\launcher.log",
-                                root.display()
-                            ));
-                        }
+                    if let Err(e) = proxy::launch(&root, &cfg_to_launch, &forward) {
+                        let msg = format!("launch failed: {e:#}");
+                        log_event(&msg);
+                        dialogs::error(&format!(
+                            "Could not launch Codex.\n\n{msg}\n\nLog: {}",
+                            launcher_log_display()
+                        ));
                     }
                     let _ = slint::quit_event_loop();
                 }
@@ -450,16 +445,13 @@ fn wire_installer_ui(
                 use_current_junction: use_junction,
                 register_uninstall: ui.get_register_uninstall(),
             };
-            match proxy::launch(&root, &cfg, &[]) {
-                Ok(()) => log_event(&root, "post-install: spawned Codex"),
-                Err(e) => {
-                    let msg = format!("post-install launch failed: {e:#}");
-                    log_event(&root, &msg);
-                    dialogs::error(&format!(
-                        "Could not launch Codex.\n\n{msg}\n\nLog: {}\\launcher.log",
-                        root.display()
-                    ));
-                }
+            if let Err(e) = proxy::launch(&root, &cfg, &[]) {
+                let msg = format!("post-install launch failed: {e:#}");
+                log_event(&msg);
+                dialogs::error(&format!(
+                    "Could not launch Codex.\n\n{msg}\n\nLog: {}",
+                    launcher_log_display()
+                ));
             }
             let _ = ui.window().hide();
         });
@@ -1077,18 +1069,51 @@ fn newest_numeric_version(versions: &std::path::Path) -> Option<(String, std::pa
     best.map(|(_, n, p)| (n, p))
 }
 
-/// Append a single timestamped line to `<root>/launcher.log`. Used to surface
-/// errors / events from the GUI subsystem build (where eprintln! is a no-op).
-/// Best-effort; failures are swallowed.
-fn log_event(root: &std::path::Path, msg: &str) {
+/// Fallback string used in user-facing messages when `LOCALAPPDATA` is
+/// unexpectedly unset. Mirrors the resolved path's shape so users can
+/// still find the directory if needed.
+const LAUNCHER_LOG_PATH_FALLBACK: &str = "%LOCALAPPDATA%\\codex-launcher\\launcher.log";
+
+/// Per-user log location, always writable regardless of install mode
+/// (System installs to Program Files can't write next to the launcher exe
+/// without elevation). Also kept *outside* the install root so the
+/// uninstaller's `rmdir(root)` doesn't trip on a leftover log file.
+fn launcher_log_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    Some(
+        std::path::PathBuf::from(base)
+            .join("codex-launcher")
+            .join("launcher.log"),
+    )
+}
+
+/// User-facing rendering of the log path. Returns the resolved path if
+/// available, the fallback string otherwise. Use this when constructing
+/// MessageBox / dialog text — never inline `launcher_log_path()` + a
+/// fallback literal at the call site.
+fn launcher_log_display() -> String {
+    launcher_log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| LAUNCHER_LOG_PATH_FALLBACK.to_string())
+}
+
+/// Append a single timestamped line to the per-user launcher log. Used to
+/// surface errors / events from the GUI subsystem build (where `eprintln!`
+/// is a no-op). Best-effort; failures are swallowed.
+fn log_event(msg: &str) {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+    let Some(path) = launcher_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = format!("[{ts}] {msg}\n");
-    let path = root.join("launcher.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
