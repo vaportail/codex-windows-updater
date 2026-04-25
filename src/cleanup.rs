@@ -243,27 +243,44 @@ pub fn delete_self_exe() -> SelfDeleteOutcome {
     }
 }
 
-/// Spawn a detached `cmd.exe` that retries deleting `exe` until it
+/// Spawn a detached cmd helper that retries deleting `exe` until it
 /// succeeds or hits the iteration cap (~30 attempts × 1s ≈ 30 seconds).
-/// Each iteration: try `del`, check if file is gone, sleep ~1s, retry.
-/// First attempt happens immediately so if our process exits quickly the
-/// file goes away on the first try.
+///
+/// Implemented by writing a one-shot .bat to `%TEMP%` and running it via
+/// `cmd /c`. The bat file lets us escape `%` literally as `%%` — something
+/// that's impossible to do safely on a `cmd /c` command line, where any
+/// `%FOO%` in `exe` would expand to an env var. Other shell metacharacters
+/// (`&`, `^`, `!`, parens) are neutralized by wrapping the path in double
+/// quotes inside the bat. The bat self-deletes at the end.
 #[cfg(windows)]
 fn spawn_cmd_self_delete(exe: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-    let exe_q = format!("\"{}\"", exe.display());
-    // FOR /L iterates 1..=30. Each pass attempts del (silently swallowing
-    // errors), then exits if the file is gone, otherwise sleeps ~1s via
-    // ping (more portable than `timeout` in non-interactive contexts).
-    let cmd_line = format!(
-        "for /L %i in (1,1,30) do (del /f /q {exe_q} 2>nul & if not exist {exe_q} exit & ping -n 2 127.0.0.1 >nul)"
+    let bat_path = std::env::temp_dir().join(format!(
+        "codex-launcher-selfdelete-{}.bat",
+        std::process::id()
+    ));
+    // Escape `%` -> `%%` (batch literal) so paths like `C:\X\%foo%\app.exe`
+    // can't expand to environment variables. Inside `"..."`, the other
+    // metachars (`&`, `^`, `!`, parens) are inert in batch context.
+    let exe_str = exe.to_string_lossy().replace('%', "%%");
+    let script = format!(
+        "@echo off\r\n\
+         for /L %%i in (1,1,30) do (\r\n\
+           del /f /q \"{exe_str}\" 2>nul\r\n\
+           if not exist \"{exe_str}\" goto :done\r\n\
+           ping -n 2 127.0.0.1 >nul\r\n\
+         )\r\n\
+         :done\r\n\
+         del /f /q \"%~f0\" 2>nul\r\n"
     );
+    std::fs::write(&bat_path, script)?;
 
     std::process::Command::new("cmd.exe")
-        .args(["/c", &cmd_line])
+        .arg("/c")
+        .arg(&bat_path)
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()?;
     Ok(())

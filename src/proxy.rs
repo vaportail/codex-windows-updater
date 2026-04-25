@@ -126,7 +126,7 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
     if let Some(udd) = codex_user_data_dir() {
         if let Some(holder) = find_singleton_holder(&udd) {
             let versions_root = root.join("versions");
-            if !holder.image_path.starts_with(&versions_root) {
+            if !path_starts_with_ci(&holder.image_path, &versions_root) {
                 let body = format!(
                     "Codex is currently running from a different install:\n\n\
                      {}\n\n\
@@ -136,14 +136,16 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
                      then launch this install cleanly.",
                     holder.image_path.display()
                 );
-                let chose_ok = crate::dialogs::two_button_choice(
+                let choice = crate::dialogs::two_button_choice(
                     "Codex launcher",
                     "Another Codex installation is running",
                     &body,
                     "OK",
                     "Kill other",
                 );
-                if !chose_ok {
+                // Esc/X dismissal = safe default (no kill). Only kill on an
+                // explicit Secondary click.
+                if choice == crate::dialogs::DialogChoice::Secondary {
                     kill_foreign_codex(&holder, &versions_root);
                 }
             }
@@ -171,12 +173,34 @@ fn kill_foreign_codex(holder: &SingletonHolder, versions_root: &Path) {
     let mut to_kill = Vec::new();
     for pid in find_codex_pids() {
         match process_image_path(pid) {
-            Some(img) if !img.starts_with(versions_root) => to_kill.push(pid),
+            Some(img) if !path_starts_with_ci(&img, versions_root) => to_kill.push(pid),
             None if pid == holder.pid => to_kill.push(pid), // confirmed foreign, can't query
             _ => {}
         }
     }
     terminate_pids(&to_kill, 5000);
+}
+
+/// Case-insensitive `Path::starts_with` for Windows paths. `QueryFullProcessImageNameW`
+/// and `current_exe()` may return paths with differing casing (e.g. `C:\Program Files\...`
+/// vs `C:\PROGRA~1\...` — though we don't handle short names here, only case).
+/// Lowercasing is sufficient for the common collision: `C:\Users\X\...` vs
+/// `C:\users\x\...`.
+fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
+    let p = path.to_string_lossy().to_lowercase();
+    let pre = prefix.to_string_lossy().to_lowercase();
+    // Match on path components, not raw substring — avoid `C:\foo` matching
+    // `C:\foobar`. Append a separator to the prefix and check prefix-of, or
+    // accept exact equality.
+    if p == pre {
+        return true;
+    }
+    let pre_sep = if pre.ends_with('\\') || pre.ends_with('/') {
+        pre
+    } else {
+        format!("{pre}\\")
+    };
+    p.starts_with(&pre_sep)
 }
 
 #[cfg(not(windows))]
@@ -193,7 +217,7 @@ pub fn find_our_codex_pids(versions_root: &Path) -> Vec<u32> {
         .into_iter()
         .filter(|&pid| {
             process_image_path(pid)
-                .map(|img| img.starts_with(versions_root))
+                .map(|img| path_starts_with_ci(&img, versions_root))
                 .unwrap_or(false)
         })
         .collect()

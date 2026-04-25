@@ -39,17 +39,28 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Result of a `two_button_choice` prompt. `Cancelled` means the user
+/// dismissed the dialog (Esc / X) — callers must treat this as "no
+/// affirmative choice" and pick a safe default, not silently fall through
+/// to `Secondary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogChoice {
+    Primary,
+    Secondary,
+    Cancelled,
+}
+
 /// Two-button TaskDialog with custom button labels (Vista+ API, lets us
 /// avoid the OS-locked OK/Cancel/Yes/No labels). `button1` is selected by
-/// default. Returns `true` if `button1` was clicked, `false` for `button2`
-/// or if the dialog was dismissed.
+/// default. Returns `Primary`/`Secondary` for explicit clicks, `Cancelled`
+/// for dialog dismissal.
 pub fn two_button_choice(
     title: &str,
     main_instruction: &str,
     body: &str,
     button1: &str,
     button2: &str,
-) -> bool {
+) -> DialogChoice {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Controls::{
@@ -111,9 +122,13 @@ pub fn two_button_choice(
     let mut clicked: i32 = 0;
     unsafe {
         if TaskDialogIndirect(&config, Some(&mut clicked), None, None).is_err() {
-            return true; // on failure, behave as if default (button1) was selected
+            return DialogChoice::Primary; // on API failure, behave as if default was selected
         }
     }
     let _ = PWSTR::null(); // silence unused-import warnings if any
-    clicked == ID_BTN1
+    match clicked {
+        ID_BTN1 => DialogChoice::Primary,
+        ID_BTN2 => DialogChoice::Secondary,
+        _ => DialogChoice::Cancelled,
+    }
 }
