@@ -59,6 +59,9 @@ fn main() -> anyhow::Result<()> {
     if args.iter().any(|a| a == "--uninstall") {
         return run_uninstall_ui();
     }
+    if args.iter().any(|a| a == "--debug-singleton") {
+        return run_debug_singleton(parse_string_flag(&args, "--user-data-dir"));
+    }
 
     // If this is an elevated re-spawn from the wizard, we skip mode
     // detection and run installer mode directly with pre-seeded state.
@@ -140,11 +143,12 @@ fn run_proxy(
         return Ok(());
     }
 
-    // Normal proxy path: always open the splash immediately on screen 11 so
-    // the user sees *something* while the check runs. The check itself moves
-    // to a background thread; when it returns, we either silent-launch
-    // (Skipped/UpToDate/Error → hide + quit_event_loop) or transition to
-    // screen 12 (Available).
+    // Normal proxy path: build the UI but do NOT show the window. The check
+    // runs on a bg thread; when it returns:
+    //   - Available → show the window on screen 12 (the prompt)
+    //   - anything else → silent-launch + quit_event_loop, window never shown
+    // This avoids the white-flash that happens when a window is created and
+    // closed before Slint's first paint reaches the screen.
     let ui = AppWindow::new()?;
     center_window(&ui);
     let cfg_for_launch = cfg.clone();
@@ -156,9 +160,14 @@ fn run_proxy(
         root.clone(),
         forward.clone(),
     )?;
-    ui.set_current_screen(11);
+    ui.window().hide()?; // ensure invisible until we explicitly show
+
+    // Optional artificial floor on splash visibility. Disabled (0) by default;
+    // set to a positive value if you want a deliberate "we're checking" pause.
+    const MIN_SPLASH_MS: u64 = 0;
 
     let ui_weak = ui.as_weak();
+    let splash_start = std::time::Instant::now();
     std::thread::spawn(move || {
         let decision = updater::check_auto(&cfg_for_check, store::PRODUCT_ID_CODEX);
 
@@ -178,6 +187,16 @@ fn run_proxy(
             _ => cfg_for_launch.clone(),
         };
 
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            if MIN_SPLASH_MS > 0 {
+                let elapsed = splash_start.elapsed().as_millis() as u64;
+                if elapsed < MIN_SPLASH_MS {
+                    std::thread::sleep(std::time::Duration::from_millis(MIN_SPLASH_MS - elapsed));
+                }
+            }
+        }
+
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             match decision {
@@ -185,25 +204,40 @@ fn run_proxy(
                     ui.set_update_current_version(current.into());
                     ui.set_update_latest_version(latest.into());
                     ui.set_current_screen(12);
+                    let _ = ui.show();
                 }
                 other => {
                     if let UpdateDecision::Skipped { reason } = &other {
-                        eprintln!("update check skipped: {reason}");
+                        log_event(&root, &format!("update check skipped: {reason}"));
                     }
                     if let UpdateDecision::Error(e) = &other {
-                        eprintln!("update check failed: {e}; launching anyway");
+                        log_event(
+                            &root,
+                            &format!("update check failed: {e}; launching anyway"),
+                        );
                     }
-                    if let Err(e) = proxy::launch(&root, &cfg_to_launch, &forward) {
-                        eprintln!("launch failed: {e:#}");
+                    match proxy::launch(&root, &cfg_to_launch, &forward) {
+                        Ok(()) => log_event(&root, "spawned Codex"),
+                        Err(e) => {
+                            let msg = format!("launch failed: {e:#}");
+                            log_event(&root, &msg);
+                            dialogs::error(&format!(
+                                "Could not launch Codex.\n\n{msg}\n\nLog: {}\\launcher.log",
+                                root.display()
+                            ));
+                        }
                     }
-                    let _ = ui.window().hide();
                     let _ = slint::quit_event_loop();
                 }
             }
         });
     });
 
-    ui.run()?;
+    // Run the event loop without showing the window. Slint stays alive
+    // because the bg thread holds a reference; when it calls quit_event_loop
+    // (silent-launch path) or the user closes the prompt (Available path),
+    // we return.
+    slint::run_event_loop()?;
     Ok(())
 }
 
@@ -416,8 +450,16 @@ fn wire_installer_ui(
                 use_current_junction: use_junction,
                 register_uninstall: ui.get_register_uninstall(),
             };
-            if let Err(e) = proxy::launch(&root, &cfg, &[]) {
-                eprintln!("launch failed: {e:#}");
+            match proxy::launch(&root, &cfg, &[]) {
+                Ok(()) => log_event(&root, "post-install: spawned Codex"),
+                Err(e) => {
+                    let msg = format!("post-install launch failed: {e:#}");
+                    log_event(&root, &msg);
+                    dialogs::error(&format!(
+                        "Could not launch Codex.\n\n{msg}\n\nLog: {}\\launcher.log",
+                        root.display()
+                    ));
+                }
             }
             let _ = ui.window().hide();
         });
@@ -1035,6 +1077,27 @@ fn newest_numeric_version(versions: &std::path::Path) -> Option<(String, std::pa
     best.map(|(_, n, p)| (n, p))
 }
 
+/// Append a single timestamped line to `<root>/launcher.log`. Used to surface
+/// errors / events from the GUI subsystem build (where eprintln! is a no-op).
+/// Best-effort; failures are swallowed.
+fn log_event(root: &std::path::Path, msg: &str) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{ts}] {msg}\n");
+    let path = root.join("launcher.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Parse `--fetcher <direct|winget|local>`. Returns None if absent or unrecognized.
 fn parse_fetcher_flag(args: &[String]) -> Option<Fetcher> {
     parse_string_flag(args, "--fetcher").and_then(|v| Fetcher::parse(&v))
@@ -1056,6 +1119,34 @@ fn parse_string_flag(args: &[String], name: &str) -> Option<String> {
 }
 
 // -- debug / smoke-test entrypoints -----------------------------------------
+
+/// Run the same singleton probe the production launcher uses, against the
+/// userData path Codex would compute (or one given via `--user-data-dir`),
+/// and report the result. Useful for diagnosing "why doesn't my Codex
+/// launch the way I expect" without rebuilding any logic.
+fn run_debug_singleton(user_data_dir: Option<String>) -> anyhow::Result<()> {
+    let udd = match user_data_dir.map(std::path::PathBuf::from) {
+        Some(p) => p,
+        None => proxy::codex_user_data_dir().ok_or_else(|| {
+            anyhow::anyhow!("could not derive Codex userData path (set APPDATA?)")
+        })?,
+    };
+    println!("Probing Codex singleton with userData: {}", udd.display());
+
+    match proxy::find_singleton_holder(&udd) {
+        Some(holder) => {
+            println!("Singleton is HELD.");
+            println!("  PID:        {}", holder.pid);
+            println!("  Image path: {}", holder.image_path.display());
+        }
+        None => {
+            println!("Singleton is NOT held — no responsive Codex main process found.");
+            println!("(Spawning would create a fresh main; orphan child processes do not");
+            println!(" count because their parent's message pump is dead.)");
+        }
+    }
+    Ok(())
+}
 
 fn run_test_fetch() -> anyhow::Result<()> {
     println!("Dumping SyncUpdates via Direct fetcher...");

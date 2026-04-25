@@ -1,8 +1,11 @@
 //! Proxy-mode runtime: resolve the newest installed Codex.exe (self-healing
 //! the `versions/current` junction if needed) and spawn it with the caller's
-//! args + inherited env. If Codex is already running, no-op — Codex ships
-//! its own single-instance mutex, so launching again would be a confusing
-//! no-op anyway.
+//! args + inherited env. We always spawn — Codex's own chromium-derived
+//! ProcessSingleton handles the "already running, focus instead" case via
+//! its named-pipe handoff. Before spawning we probe for the singleton's
+//! hidden message window so we can warn the user if a *foreign* Codex
+//! install is currently the lock holder (their window will get focused
+//! instead of ours).
 
 use crate::config::Config;
 use anyhow::{Context, Result};
@@ -14,16 +17,137 @@ pub fn resolve_codex_exe(root: &Path, use_junction: bool) -> Option<PathBuf> {
     crate::latest_codex_exe(root, use_junction)
 }
 
-/// Spawn Codex.exe with forwarded args. Env is inherited by default.
-/// Returns `Ok(())` even when Codex is already running — the launcher's
-/// job is done in that case.
+/// Identity of the process currently holding Codex's chromium ProcessSingleton.
+#[derive(Debug, Clone)]
+pub struct SingletonHolder {
+    pub pid: u32,
+    pub image_path: PathBuf,
+}
+
+/// Compute the userData path Codex's main process uses, mirroring the logic
+/// in `bootstrap.js`:
+///   1. `CODEX_ELECTRON_USER_DATA_PATH` env var (resolved absolute) if set,
+///   2. otherwise `%APPDATA%\Codex` (production build flavor).
+///
+/// We don't reproduce the `agent` build-flavor branch — our launcher only
+/// runs against the production desktop install.
+pub fn codex_user_data_dir() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("CODEX_ELECTRON_USER_DATA_PATH") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(PathBuf::from(v));
+        }
+    }
+    let appdata = std::env::var("APPDATA").ok()?;
+    Some(PathBuf::from(appdata).join("Codex"))
+}
+
+/// Probe Codex's chromium ProcessSingleton. Looks for the hidden
+/// message-only window with class `Chrome_MessageWindow` whose title equals
+/// the userData path — that window is created by the lock-holding main
+/// process on startup. Returns `None` if no responsive holder exists (in
+/// which case spawning a fresh main is safe).
+#[cfg(windows)]
+pub fn find_singleton_holder(user_data_dir: &Path) -> Option<SingletonHolder> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, GetWindowThreadProcessId, HWND_MESSAGE,
+    };
+
+    let class: Vec<u16> = "Chrome_MessageWindow"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let title: Vec<u16> = user_data_dir
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let hwnd = FindWindowExW(
+            HWND_MESSAGE,
+            windows::Win32::Foundation::HWND::default(),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+        )
+        .ok()?;
+        if hwnd.0.is_null() {
+            return None;
+        }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(h);
+        if r.is_err() {
+            return None;
+        }
+        Some(SingletonHolder {
+            pid,
+            image_path: PathBuf::from(String::from_utf16_lossy(&buf[..size as usize])),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn find_singleton_holder(_user_data_dir: &Path) -> Option<SingletonHolder> {
+    None
+}
+
+/// Spawn Codex.exe with forwarded args. Always spawns — Codex's own
+/// ProcessSingleton handles the "already running" case via pipe handoff,
+/// transferring focus to the lock-holder. Before spawning we check the
+/// singleton; if a *foreign* install holds it, we MessageBox the user so
+/// they understand why their click may surface that other install's window
+/// instead of ours.
 pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> {
     let exe = resolve_codex_exe(root, cfg.use_current_junction)
         .ok_or_else(|| anyhow::anyhow!("no installed Codex.exe found under {}", root.display()))?;
 
-    if is_codex_running() {
-        eprintln!("Codex already running; not spawning another instance");
-        return Ok(());
+    if let Some(udd) = codex_user_data_dir() {
+        if let Some(holder) = find_singleton_holder(&udd) {
+            let versions_root = root.join("versions");
+            if !holder.image_path.starts_with(&versions_root) {
+                let body = format!(
+                    "Codex is currently running from a different install:\n\n\
+                     {}\n\n\
+                     OK — Launch this install anyway. Codex's single-instance handling \
+                     may transfer focus to the running install instead of starting yours fresh.\n\n\
+                     Kill other — Terminate the other Codex (and its child processes), \
+                     then launch this install cleanly.",
+                    holder.image_path.display()
+                );
+                let chose_ok = crate::dialogs::two_button_choice(
+                    "Codex launcher",
+                    "Another Codex installation is running",
+                    &body,
+                    "OK",
+                    "Kill other",
+                );
+                if !chose_ok {
+                    kill_foreign_codex(&holder, &versions_root);
+                }
+            }
+        }
     }
 
     // Working dir = the versioned install dir so relative resource lookups
@@ -37,9 +161,53 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
     Ok(())
 }
 
-/// Cheap boolean variant — is anything named Codex.exe running?
-pub fn is_codex_running() -> bool {
-    !find_codex_pids().is_empty()
+/// Terminate every `Codex.exe` process whose image path is NOT under
+/// `versions_root`. We confirm the holder is foreign first, then sweep
+/// every other Codex.exe (children share the same foreign image). Waits
+/// up to 5s per PID for exit so the new spawn doesn't race a still-alive
+/// holder.
+#[cfg(windows)]
+fn kill_foreign_codex(holder: &SingletonHolder, versions_root: &Path) {
+    let mut to_kill = Vec::new();
+    for pid in find_codex_pids() {
+        match process_image_path(pid) {
+            Some(img) if !img.starts_with(versions_root) => to_kill.push(pid),
+            None if pid == holder.pid => to_kill.push(pid), // confirmed foreign, can't query
+            _ => {}
+        }
+    }
+    terminate_pids(&to_kill, 5000);
+}
+
+#[cfg(not(windows))]
+fn kill_foreign_codex(_holder: &SingletonHolder, _versions_root: &Path) {}
+
+/// Get the full image path for `pid`, or `None` if we can't query it.
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Option<PathBuf> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(h);
+        if r.is_err() {
+            return None;
+        }
+        Some(PathBuf::from(String::from_utf16_lossy(
+            &buf[..size as usize],
+        )))
+    }
 }
 
 /// Walk the process table collecting PIDs of every process named `Codex.exe`.
