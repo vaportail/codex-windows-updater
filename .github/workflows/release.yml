@@ -40,7 +40,7 @@ jobs:
           Write-Host "SHA-256: $hash"
 
       - name: Generate build provenance attestation
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/codex-launcher.exe
 
