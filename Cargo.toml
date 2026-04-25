@@ -1,6 +1,6 @@
 [package]
 name = "codex-updater"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Unofficial installer/updater for the Codex Windows app"
@@ -20,6 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 zip = { version = "2", default-features = false, features = ["deflate"] }
 directories = "5"
 quick-xml = "0.36"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

@@ -3,34 +3,41 @@
 //! runs. Single dedicated thread with its own message loop; main thread
 //! posts WM_CLOSE on drop to tear it down.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    FreeLibrary, BOOL, COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH,
+    HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{
+    EnumResourceNamesW, FindResourceW, LoadLibraryExW, LoadResource, LockResource, SizeofResource,
+    LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, DrawIconEx, GetMessageW,
-    GetSystemMetrics, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetLayeredWindowAttributes, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    DI_NORMAL, HICON, IDC_ARROW, LWA_ALPHA, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_CLOSE,
-    WM_DESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOPMOST,
-    WS_POPUP,
+    CreateIconFromResourceEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW,
+    DrawIconEx, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetTimer, ShowWindow,
+    TranslateMessage, DI_NORMAL, HICON, IDC_ARROW, LR_DEFAULTCOLOR, LWA_ALPHA, MSG, RT_GROUP_ICON,
+    RT_ICON, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const CLASS_NAME: PCWSTR = w!("CodexUpdaterSplash");
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 16;
+const WM_SET_STATUS: u32 = WM_APP + 1;
 
 const LOGICAL_W: i32 = 380;
 const LOGICAL_H: i32 = 220;
@@ -68,6 +75,21 @@ impl Splash {
             .filter(|h| *h != 0)?;
         Some(Self { hwnd })
     }
+
+    pub fn set_status(&self, status: &str) {
+        if self.hwnd == 0 {
+            return;
+        }
+        let status = Box::new(status.to_string());
+        unsafe {
+            let _ = PostMessageW(
+                HWND(self.hwnd as *mut _),
+                WM_SET_STATUS,
+                WPARAM(0),
+                LPARAM(Box::into_raw(status) as isize),
+            );
+        }
+    }
 }
 
 impl Drop for Splash {
@@ -85,6 +107,7 @@ thread_local! {
     static HICON_PTR: Cell<isize> = const { Cell::new(0) };
     static BAR_OFFSET: Cell<i32> = const { Cell::new(0) };
     static SCALE: Cell<f32> = const { Cell::new(1.0) };
+    static STATUS_TEXT: RefCell<String> = RefCell::new("Loading Codex...".to_string());
 }
 
 unsafe fn run_splash(codex_exe: Option<&Path>, tx: mpsc::Sender<usize>) {
@@ -100,7 +123,6 @@ unsafe fn run_splash(codex_exe: Option<&Path>, tx: mpsc::Sender<usize>) {
     let hinstance: HINSTANCE = HINSTANCE(hinstance.0);
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinstance,
         lpszClassName: CLASS_NAME,
@@ -119,7 +141,7 @@ unsafe fn run_splash(codex_exe: Option<&Path>, tx: mpsc::Sender<usize>) {
     let x = ((screen_w - w) / 2).max(0);
     let y = ((screen_h - h) / 2).max(0);
 
-    let hicon = codex_exe.and_then(|p| load_icon(p));
+    let hicon = codex_exe.and_then(|p| load_icon(p, (ICON_SIZE as f32 * scale) as i32));
     if let Some(icon) = hicon {
         HICON_PTR.with(|c| c.set(icon.0 as isize));
     }
@@ -167,6 +189,16 @@ unsafe fn run_splash(codex_exe: Option<&Path>, tx: mpsc::Sender<usize>) {
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_SET_STATUS => {
+            let ptr = lp.0 as *mut String;
+            if !ptr.is_null() {
+                let status = Box::from_raw(ptr);
+                STATUS_TEXT.with(|s| *s.borrow_mut() = *status);
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             paint(hwnd);
             LRESULT(0)
@@ -188,8 +220,37 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
-
     let scale = SCALE.with(|s| s.get());
+    let w = (LOGICAL_W as f32 * scale) as i32;
+    let h = (LOGICAL_H as f32 * scale) as i32;
+
+    let mem_dc = CreateCompatibleDC(hdc);
+    let mem_bitmap = CreateCompatibleBitmap(hdc, w, h);
+    if mem_dc.is_invalid() || mem_bitmap.is_invalid() {
+        paint_content(hdc, scale);
+        if !mem_bitmap.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(mem_bitmap.0));
+        }
+        if !mem_dc.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+        }
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    }
+
+    let old_bitmap = SelectObject(mem_dc, HGDIOBJ(mem_bitmap.0));
+    paint_content(mem_dc, scale);
+    let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+    if !old_bitmap.0.is_null() {
+        SelectObject(mem_dc, old_bitmap);
+    }
+    let _ = DeleteObject(HGDIOBJ(mem_bitmap.0));
+    let _ = DeleteDC(mem_dc);
+
+    let _ = EndPaint(hwnd, &ps);
+}
+
+unsafe fn paint_content(hdc: HDC, scale: f32) {
     let scaled = |v: i32| (v as f32 * scale) as i32;
     let w = scaled(LOGICAL_W);
     let h = scaled(LOGICAL_H);
@@ -264,7 +325,7 @@ unsafe fn paint(hwnd: HWND) {
         DT_CENTER | DT_SINGLELINE | DT_VCENTER,
     );
 
-    // "Checking for updates…"
+    // Status text.
     let sub_y = title_y + title_h + scaled(2);
     let sub_h = scaled(18);
     let sub_font = CreateFontW(
@@ -285,7 +346,7 @@ unsafe fn paint(hwnd: HWND) {
     );
     SelectObject(hdc, HGDIOBJ(sub_font.0));
     SetTextColor(hdc, COLORREF(COLOR_DIM));
-    let mut sub: Vec<u16> = "Checking for updates…".encode_utf16().collect();
+    let mut sub: Vec<u16> = STATUS_TEXT.with(|s| s.borrow().encode_utf16().collect());
     let mut sub_rect = RECT {
         left: 0,
         top: sub_y,
@@ -334,23 +395,152 @@ unsafe fn paint(hwnd: HWND) {
 
     let _ = DeleteObject(HGDIOBJ(title_font.0));
     let _ = DeleteObject(HGDIOBJ(sub_font.0));
-
-    let _ = EndPaint(hwnd, &ps);
 }
 
-/// Best-effort: extract the largest icon group from `path`. Returns the
-/// system-large variant; DrawIconEx scales it to our target size.
-unsafe fn load_icon(path: &Path) -> Option<HICON> {
+/// Best-effort: enumerate icon resources in `path`, pick the largest embedded
+/// image, then ask Windows to scale that source to the splash's DPI-aware size.
+unsafe fn load_icon(path: &Path, desired_size: i32) -> Option<HICON> {
     let wide: Vec<u16> = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let mut large = HICON::default();
-    let n = ExtractIconExW(PCWSTR(wide.as_ptr()), 0, Some(&mut large), None, 1);
-    if n > 0 && !large.is_invalid() {
-        Some(large)
-    } else {
-        None
+    let module = LoadLibraryExW(
+        PCWSTR(wide.as_ptr()),
+        None,
+        LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+    )
+    .ok()?;
+
+    let mut search = IconSearch::default();
+    let _ = EnumResourceNamesW(
+        module,
+        RT_GROUP_ICON,
+        Some(enum_icon_group),
+        &mut search as *mut _ as isize,
+    );
+
+    let icon = search.best.and_then(|best| {
+        let res_name = int_resource(best.resource_id);
+        let bytes = resource_bytes(module, res_name, RT_ICON)?;
+        CreateIconFromResourceEx(
+            bytes,
+            true,
+            0x0003_0000,
+            desired_size,
+            desired_size,
+            LR_DEFAULTCOLOR,
+        )
+        .ok()
+        .filter(|icon| !icon.is_invalid())
+    });
+
+    let _ = FreeLibrary(module);
+    icon
+}
+
+#[derive(Clone, Copy, Default)]
+struct IconSearch {
+    best: Option<IconCandidate>,
+}
+
+#[derive(Clone, Copy)]
+struct IconCandidate {
+    resource_id: u16,
+    width: u16,
+    height: u16,
+    bit_count: u16,
+    bytes_in_res: u32,
+}
+
+impl IconCandidate {
+    fn score(self) -> (u32, u16, u32) {
+        (
+            u32::from(self.width) * u32::from(self.height),
+            self.bit_count,
+            self.bytes_in_res,
+        )
     }
+}
+
+unsafe extern "system" fn enum_icon_group(
+    module: HMODULE,
+    _typ: PCWSTR,
+    name: PCWSTR,
+    lparam: isize,
+) -> BOOL {
+    let search = &mut *(lparam as *mut IconSearch);
+    if let Some(bytes) = resource_bytes(module, name, RT_GROUP_ICON) {
+        for candidate in parse_icon_group(bytes) {
+            let replace = search
+                .best
+                .map(|best| candidate.score() > best.score())
+                .unwrap_or(true);
+            if replace {
+                search.best = Some(candidate);
+            }
+        }
+    }
+    true.into()
+}
+
+fn parse_icon_group(bytes: &[u8]) -> Vec<IconCandidate> {
+    if bytes.len() < 6 {
+        return Vec::new();
+    }
+    let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+    let mut out = Vec::new();
+    for i in 0..count {
+        let offset = 6 + i * 14;
+        if offset + 14 > bytes.len() {
+            break;
+        }
+        let width = icon_dim(bytes[offset]);
+        let height = icon_dim(bytes[offset + 1]);
+        let bit_count = u16::from_le_bytes([bytes[offset + 6], bytes[offset + 7]]);
+        let bytes_in_res = u32::from_le_bytes([
+            bytes[offset + 8],
+            bytes[offset + 9],
+            bytes[offset + 10],
+            bytes[offset + 11],
+        ]);
+        let resource_id = u16::from_le_bytes([bytes[offset + 12], bytes[offset + 13]]);
+        out.push(IconCandidate {
+            resource_id,
+            width,
+            height,
+            bit_count,
+            bytes_in_res,
+        });
+    }
+    out
+}
+
+fn icon_dim(byte: u8) -> u16 {
+    if byte == 0 {
+        256
+    } else {
+        u16::from(byte)
+    }
+}
+
+unsafe fn resource_bytes(module: HMODULE, name: PCWSTR, typ: PCWSTR) -> Option<&'static [u8]> {
+    let res = FindResourceW(module, name, typ);
+    if res.is_invalid() {
+        return None;
+    }
+    let size = SizeofResource(module, res);
+    if size == 0 {
+        return None;
+    }
+    let data = LoadResource(module, res).ok()?;
+    let ptr = LockResource(data) as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr, size as usize))
+}
+
+fn int_resource(id: u16) -> PCWSTR {
+    PCWSTR(id as usize as *const u16)
 }

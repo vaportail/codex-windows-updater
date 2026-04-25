@@ -10,6 +10,7 @@ mod elevate;
 mod extract;
 mod installer;
 mod junction;
+mod launcher_update;
 mod mode;
 mod path_dialog;
 mod proxy;
@@ -23,6 +24,7 @@ mod updater;
 
 use config::{Config, InstallMode};
 use installer::{InstallMsg, InstallOptions};
+use launcher_update::LauncherUpdateMsg;
 use slint::ComponentHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +35,27 @@ slint::include_modules!();
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Smoke-test probe used by the self-update flow. MUST stay first — the
+    // contract is that `--self-test` returns Ok(()) with zero side effects
+    // (no cleanup, no mode detection, no UI, no network, no log writes).
+    // The self-update worker spawns the freshly-downloaded `.new.exe` with
+    // this flag to confirm the binary runs on this machine before swapping
+    // it in.
+    if args.iter().any(|a| a == "--self-test") {
+        return Ok(());
+    }
+
+    // Best-effort cleanup of a half-written `codex-launcher.new.exe` from a
+    // prior interrupted self-update. `codex-launcher.old.exe` is preserved
+    // as the manual-rollback artifact.
+    launcher_update::cleanup_stale_new_launcher();
+
+    // Elevated re-spawn from the launcher self-update path. Skip mode
+    // detection entirely — we just need to download/swap and exit.
+    if let Some(target) = parse_string_flag(&args, "--auto-self-update") {
+        return run_auto_self_update(&target);
+    }
 
     // CLI fetcher override — takes precedence over updater.json for this run.
     let fetcher_override = parse_fetcher_flag(&args);
@@ -189,6 +212,13 @@ fn run_proxy(
     let ui_weak = ui.as_weak();
     let cfg_shared_for_bg = cfg_shared.clone();
     std::thread::spawn(move || {
+        if updater::auto_check_will_query(&cfg_for_check)
+            || updater::launcher_auto_check_will_query(&cfg_for_check)
+        {
+            if let Some(splash) = &splash {
+                splash.set_status("Checking for updates...");
+            }
+        }
         let codex_decision = updater::check_auto(&cfg_for_check, store::PRODUCT_ID_CODEX);
         // Run the launcher check against the same cfg snapshot so both
         // checks see the same `last_check_unix` and either both fire (when
@@ -806,6 +836,42 @@ fn wire_proxy_ui(
                 return;
             }
 
+            if action == updater::LauncherDeferChoice::ApplyUpdate {
+                let latest = ui.get_launcher_latest_version().to_string();
+                if latest.is_empty() {
+                    return;
+                }
+                // System install lives under Program Files — replacing the
+                // exe needs admin. Re-spawn elevated and exit; the elevated
+                // process re-enters main, takes the --auto-self-update
+                // branch, and runs the worker UI.
+                let install_mode = cfg.lock().unwrap().install_mode;
+                if matches!(install_mode, InstallMode::System) && !elevate::is_elevated() {
+                    let cli = format!("--auto-self-update {latest}");
+                    match elevate::respawn_elevated(&cli) {
+                        Ok(()) => {
+                            let _ = ui.window().hide();
+                            let _ = slint::quit_event_loop();
+                            return;
+                        }
+                        Err(e) => {
+                            ui.set_error_text(
+                                format!("Couldn't obtain admin rights: {e:#}").into(),
+                            );
+                            ui.set_current_screen(6);
+                            return;
+                        }
+                    }
+                }
+
+                ui.set_current_screen(4);
+                ui.set_progress_phase("Starting".into());
+                ui.set_progress_detail("".into());
+                ui.set_progress_indeterminate(true);
+                spawn_launcher_self_update_worker(ui_weak.clone(), latest);
+                return;
+            }
+
             let latest = ui.get_launcher_latest_version().to_string();
             {
                 let mut c = cfg.lock().unwrap();
@@ -907,6 +973,75 @@ fn apply_update_decision(
             }
         }
     });
+}
+
+/// Run the elevated launcher self-update flow. Skips proxy/installer logic;
+/// just opens the AppWindow on the progress screen and runs the worker.
+/// The user closes the window after Done — at which point either this
+/// elevated process or the unelevated one (User/Portable path) is the only
+/// one running, and on next launch the updated launcher takes over.
+fn run_auto_self_update(target_version: &str) -> anyhow::Result<()> {
+    dark_window::install();
+    let ui = AppWindow::new()?;
+    prepare_window(&ui);
+
+    // Surface the target version on screen 31's success message.
+    ui.set_launcher_latest_version(target_version.into());
+    ui.set_current_screen(4);
+    ui.set_progress_phase("Starting".into());
+    ui.set_progress_detail("".into());
+    ui.set_progress_indeterminate(true);
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_request_quit(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let _ = ui.window().hide();
+            }
+            let _ = slint::quit_event_loop();
+        });
+    }
+
+    spawn_launcher_self_update_worker(ui.as_weak(), target_version.to_string());
+    show_when_ready(&ui);
+    slint::run_event_loop()?;
+    Ok(())
+}
+
+fn spawn_launcher_self_update_worker(ui_weak: slint::Weak<AppWindow>, target_version: String) {
+    std::thread::spawn(move || {
+        launcher_update::apply(&target_version, move |msg| {
+            let weak = ui_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    apply_launcher_update_msg(&ui, msg);
+                }
+            });
+        });
+    });
+}
+
+fn apply_launcher_update_msg(ui: &AppWindow, msg: LauncherUpdateMsg) {
+    match msg {
+        LauncherUpdateMsg::Phase { phase, detail } => {
+            ui.set_progress_phase(phase.into());
+            ui.set_progress_detail(detail.into());
+        }
+        LauncherUpdateMsg::Progress(Some(f)) => {
+            ui.set_progress_indeterminate(false);
+            ui.set_progress_fraction(f);
+        }
+        LauncherUpdateMsg::Progress(None) => {
+            ui.set_progress_indeterminate(true);
+        }
+        LauncherUpdateMsg::Done => {
+            ui.set_current_screen(31);
+        }
+        LauncherUpdateMsg::Error(e) => {
+            ui.set_error_text(e.into());
+            ui.set_current_screen(6);
+        }
+    }
 }
 
 fn spawn_update_worker(ui_weak: slint::Weak<AppWindow>, cfg: Arc<Mutex<Config>>) {
@@ -1039,6 +1174,7 @@ fn int_to_launcher_choice(i: i32) -> updater::LauncherDeferChoice {
         3 => L::SnoozeOneDay,
         4 => L::SnoozeSevenDays,
         5 => L::Never,
+        6 => L::ApplyUpdate,
         _ => L::NotNow,
     }
 }

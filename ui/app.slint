@@ -13,6 +13,8 @@
 //  21 Uninstall progress   (reuses progress-phase/progress-detail/progress-*)
 //  22 Uninstall done
 //  23 Uninstall error/refused
+//  30 Launcher update prompt
+//  31 Launcher self-update done (restart-to-apply notice)
 
 import { VerticalBox, HorizontalBox, Button, LineEdit, CheckBox, ComboBox } from "std-widgets.slint";
 
@@ -28,13 +30,20 @@ component DarkButton inherits Rectangle {
         ? (root.primary ? #89b4fa : #45475a)
         : (root.primary ? #74c7ec : #313244);
     opacity: root.disabled ? 0.5 : 1.0;
-    Text {
-        text: root.text;
-        color: root.primary ? #11111b : #cdd6f4;
-        font-size: 13px;
-        font-weight: 600;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    // HorizontalLayout drives the Rectangle's preferred width from the
+    // Text's measured size + padding. Without a layout the Text is overlaid
+    // and `min-width: 96px` is the only width source — wider labels clip.
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Text {
+            text: root.text;
+            color: root.primary ? #11111b : #cdd6f4;
+            font-size: 13px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
     ta := TouchArea {
         enabled: !root.disabled;
@@ -125,7 +134,8 @@ export component AppWindow inherits Window {
     callback request-check-updates();
     callback request-uninstall-start();
     // Launcher prompt callbacks. action encodes: 0=ViewRelease (doesn't dismiss),
-    // 1=NotNow, 2=SkipThisVersion, 3=SnoozeOneDay, 4=SnoozeSevenDays, 5=Never.
+    // 1=NotNow, 2=SkipThisVersion, 3=SnoozeOneDay, 4=SnoozeSevenDays, 5=Never,
+    // 6=ApplyUpdate (download + replace running launcher).
     callback request-launcher-action(int);
 
     title: "Codex Updater";
@@ -136,7 +146,7 @@ export component AppWindow inherits Window {
     // Launcher reminder is shown after Codex is launched/focused, which
     // would otherwise bury it. Pin only on screen 30 so other screens
     // behave normally.
-    always-on-top: current-screen == 30;
+    always-on-top: current-screen == 30 || current-screen == 31;
 
     VerticalBox {
         padding: 24px;
@@ -162,6 +172,7 @@ export component AppWindow inherits Window {
                       root.current-screen == 22 ? "Uninstall complete" :
                       root.current-screen == 23 ? "Uninstall failed" :
                       root.current-screen == 30 ? "Launcher update available" :
+                      root.current-screen == 31 ? "Launcher updated" :
                       root.current-screen == 0 ? "Welcome" :
                       root.current-screen == 1 ? "Step 1 / 3" :
                       root.current-screen == 2 ? "Step 2 / 3" :
@@ -618,16 +629,27 @@ export component AppWindow inherits Window {
                     Rectangle {}
                 }
                 Rectangle { height: 1px; background: #313244; }
-                Text {
-                    text: "Codex has already been launched. Auto-update isn't supported yet — visit the release page to download the new launcher manually.";
-                    color: #6c7086;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
+                // Primary action row: update + view release notes.
                 HorizontalBox {
                     padding: 0px;
                     spacing: 6px;
-                    DarkButton { text: "View release";       clicked => { root.request-launcher-action(0); } }
+                    DarkButton {
+                        text: "Update launcher";
+                        primary: true;
+                        clicked => { root.request-launcher-action(6); }
+                    }
+                    DarkButton {
+                        text: "Release notes";
+                        clicked => { root.request-launcher-action(0); }
+                    }
+                    Rectangle {} // spacer pushes primary actions to the left
+                }
+                Rectangle { height: 4px; }
+                // Defer row(s): muted, secondary group.
+                Text { text: "Or defer"; color: #6c7086; font-size: 11px; }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
                     DarkButton { text: "Remind next time";  clicked => { root.request-launcher-action(1); } }
                     DarkButton { text: "Snooze 1 day";       clicked => { root.request-launcher-action(3); } }
                     DarkButton { text: "Snooze 7 days";      clicked => { root.request-launcher-action(4); } }
@@ -638,6 +660,33 @@ export component AppWindow inherits Window {
                     DarkButton { text: "Skip this version";  clicked => { root.request-launcher-action(2); } }
                     DarkButton { text: "Never";              clicked => { root.request-launcher-action(5); } }
                 }
+            }
+
+            // Launcher self-update succeeded (screen 31).
+            if root.current-screen == 31 : VerticalBox {
+                spacing: 10px;
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: "Launcher updated.";
+                    color: #a6e3a1;
+                    font-size: 18px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Version " + root.launcher-latest-version;
+                    color: #cdd6f4;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Close this window to finish. The new launcher will be used the next time you start Codex.";
+                    color: #a6adc8;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
             }
         }
 
@@ -729,6 +778,12 @@ export component AppWindow inherits Window {
             }
             if root.current-screen == 23 : DarkButton {
                 text: "Close";
+                clicked => { root.request-quit(); }
+            }
+            // Launcher self-update done
+            if root.current-screen == 31 : DarkButton {
+                text: "Close";
+                primary: true;
                 clicked => { root.request-quit(); }
             }
         }

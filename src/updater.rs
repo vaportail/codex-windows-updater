@@ -56,27 +56,8 @@ pub enum DeferChoice {
 /// Automatic check — honors policy cooldown + suppress_until. Use this from
 /// proxy-mode startup.
 pub fn check_auto(cfg: &Config, product_id: &str) -> UpdateDecision {
-    let now = now_unix();
-    if cfg.update_policy == UpdatePolicy::Never {
-        return UpdateDecision::Skipped {
-            reason: "update_policy = never".into(),
-        };
-    }
-    if let Some(until) = cfg.suppress_until_unix {
-        if now < until {
-            let days = (until - now) / 86_400;
-            return UpdateDecision::Skipped {
-                reason: format!("suppressed for ~{days}d"),
-            };
-        }
-    }
-    if let Some(last) = cfg.last_check_unix {
-        let cooldown = policy_cooldown_secs(cfg.update_policy);
-        if now.saturating_sub(last) < cooldown {
-            return UpdateDecision::Skipped {
-                reason: "within cooldown".into(),
-            };
-        }
+    if let Some(reason) = auto_check_skip_reason(cfg) {
+        return UpdateDecision::Skipped { reason };
     }
     let decision = check_now(cfg, product_id);
     // Honor "skip this version" only while the Store's latest still matches
@@ -90,6 +71,12 @@ pub fn check_auto(cfg: &Config, product_id: &str) -> UpdateDecision {
         }
     }
     decision
+}
+
+/// True when `check_auto` will perform the Store version lookup instead of
+/// skipping immediately due to policy, snooze, or cooldown.
+pub fn auto_check_will_query(cfg: &Config) -> bool {
+    auto_check_skip_reason(cfg).is_none()
 }
 
 /// Force a check regardless of policy/suppression. Use this when the user
@@ -176,6 +163,9 @@ pub enum LauncherDeferChoice {
     SnoozeSevenDays,
     /// Suppress launcher prompts effectively forever (suppress_until = u64::MAX).
     Never,
+    /// Download the new launcher and replace the running exe in place.
+    /// Caller drives the download/swap; this variant is just the action signal.
+    ApplyUpdate,
 }
 
 /// Reconstruct a pending launcher prompt from persisted state — no network.
@@ -212,27 +202,8 @@ pub fn pending_launcher_from_state(cfg: &Config) -> Option<LauncherDecision> {
 /// skip-this-version. Doesn't itself update `last_check_unix` — caller is
 /// expected to record after both checks complete.
 pub fn check_launcher_auto(cfg: &Config) -> LauncherDecision {
-    let now = now_unix();
-    if cfg.update_policy == UpdatePolicy::Never {
-        return LauncherDecision::Skipped {
-            reason: "update_policy = never".into(),
-        };
-    }
-    if let Some(until) = cfg.launcher_suppress_until_unix {
-        if now < until {
-            let days = (until - now) / 86_400;
-            return LauncherDecision::Skipped {
-                reason: format!("launcher prompt suppressed for ~{days}d"),
-            };
-        }
-    }
-    if let Some(last) = cfg.last_check_unix {
-        let cooldown = policy_cooldown_secs(cfg.update_policy);
-        if now.saturating_sub(last) < cooldown {
-            return LauncherDecision::Skipped {
-                reason: "within cooldown".into(),
-            };
-        }
+    if let Some(reason) = launcher_auto_check_skip_reason(cfg) {
+        return LauncherDecision::Skipped { reason };
     }
 
     let decision = check_launcher_now();
@@ -244,6 +215,12 @@ pub fn check_launcher_auto(cfg: &Config) -> LauncherDecision {
         }
     }
     decision
+}
+
+/// True when `check_launcher_auto` will call GitHub instead of skipping
+/// immediately due to policy, launcher snooze, or shared cooldown.
+pub fn launcher_auto_check_will_query(cfg: &Config) -> bool {
+    launcher_auto_check_skip_reason(cfg).is_none()
 }
 
 /// Force a launcher-update check regardless of policy/snooze/cooldown.
@@ -294,9 +271,12 @@ pub fn apply_launcher_defer(cfg: &mut Config, choice: LauncherDeferChoice, lates
     let now = now_unix();
     cfg.known_latest_launcher = Some(latest.to_string());
     match choice {
-        LauncherDeferChoice::ViewRelease | LauncherDeferChoice::NotNow => {
+        LauncherDeferChoice::ViewRelease
+        | LauncherDeferChoice::NotNow
+        | LauncherDeferChoice::ApplyUpdate => {
             // No state change beyond known_latest_launcher. Cooldown
-            // governs next prompt.
+            // governs next prompt. ApplyUpdate is a no-op here — the
+            // self-update worker mutates state on success.
         }
         LauncherDeferChoice::SkipThisVersion => {
             cfg.skipped_launcher_version = Some(latest.to_string());
@@ -320,6 +300,46 @@ fn policy_cooldown_secs(p: UpdatePolicy) -> u64 {
         UpdatePolicy::Weekly => 7 * 86_400,
         UpdatePolicy::Never => u64::MAX, // unreachable (filtered earlier)
     }
+}
+
+fn auto_check_skip_reason(cfg: &Config) -> Option<String> {
+    let now = now_unix();
+    if cfg.update_policy == UpdatePolicy::Never {
+        return Some("update_policy = never".into());
+    }
+    if let Some(until) = cfg.suppress_until_unix {
+        if now < until {
+            let days = (until - now) / 86_400;
+            return Some(format!("suppressed for ~{days}d"));
+        }
+    }
+    if let Some(last) = cfg.last_check_unix {
+        let cooldown = policy_cooldown_secs(cfg.update_policy);
+        if now.saturating_sub(last) < cooldown {
+            return Some("within cooldown".into());
+        }
+    }
+    None
+}
+
+fn launcher_auto_check_skip_reason(cfg: &Config) -> Option<String> {
+    let now = now_unix();
+    if cfg.update_policy == UpdatePolicy::Never {
+        return Some("update_policy = never".into());
+    }
+    if let Some(until) = cfg.launcher_suppress_until_unix {
+        if now < until {
+            let days = (until - now) / 86_400;
+            return Some(format!("launcher prompt suppressed for ~{days}d"));
+        }
+    }
+    if let Some(last) = cfg.last_check_unix {
+        let cooldown = policy_cooldown_secs(cfg.update_policy);
+        if now.saturating_sub(last) < cooldown {
+            return Some("within cooldown".into());
+        }
+    }
+    None
 }
 
 fn now_unix() -> u64 {
