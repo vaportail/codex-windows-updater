@@ -4,6 +4,7 @@
 
 mod cleanup;
 mod config;
+mod dark_window;
 mod dialogs;
 mod elevate;
 mod extract;
@@ -15,6 +16,7 @@ mod proxy;
 mod registry;
 mod safety;
 mod shortcut;
+mod splash;
 mod store;
 mod uninstall;
 mod updater;
@@ -71,10 +73,12 @@ fn main() -> anyhow::Result<()> {
 
     match m {
         mode::Mode::Installer => {
+            dark_window::install();
             let ui = AppWindow::new()?;
-            center_window(&ui);
+            prepare_window(&ui);
             wire_installer_ui(&ui, fetcher_override, auto_install)?;
-            ui.run()?;
+            show_when_ready(&ui);
+            slint::run_event_loop()?;
         }
         mode::Mode::Proxy(cfg) => {
             let auto_update = args.iter().any(|a| a == "--auto-update");
@@ -113,8 +117,9 @@ fn run_proxy(
         if !prompt_kill_codex_for("updating") {
             // User aborted at the elevated prompt. Fall through to normal
             // proxy flow so the update banner is still shown.
+            dark_window::install();
             let ui = AppWindow::new()?;
-            center_window(&ui);
+            prepare_window(&ui);
             wire_proxy_ui(
                 &ui,
                 cfg,
@@ -126,12 +131,14 @@ fn run_proxy(
                 forward,
             )?;
             ui.set_current_screen(10);
-            ui.run()?;
+            show_when_ready(&ui);
+            slint::run_event_loop()?;
             return Ok(());
         }
 
+        dark_window::install();
         let ui = AppWindow::new()?;
-        center_window(&ui);
+        prepare_window(&ui);
         // The unelevated bg check persisted launcher state then bumped the
         // shared cooldown — this re-spawn can't redo the check, so recover
         // the pending prompt from disk so on_request_launch can chain to
@@ -152,18 +159,21 @@ fn run_proxy(
         ui.set_progress_detail("".into());
         ui.set_progress_indeterminate(true);
         spawn_update_worker(ui.as_weak(), cfg_shared);
-        ui.run()?;
+        show_when_ready(&ui);
+        slint::run_event_loop()?;
         return Ok(());
     }
 
-    // Normal proxy path: build the UI but do NOT show the window. The check
-    // runs on a bg thread; when it returns:
-    //   - Available → show the window on screen 12 (the prompt)
-    //   - anything else → silent-launch + quit_event_loop, window never shown
-    // This avoids the white-flash that happens when a window is created and
-    // closed before Slint's first paint reaches the screen.
+    // Normal proxy path: native splash up immediately for instant feedback,
+    // bg thread runs check, Slint window only built/shown when we have a
+    // result that requires interaction (Available / launcher prompt). For
+    // the silent-launch path the splash is dropped just before launch so
+    // Codex appears unobstructed.
+    let splash = splash::Splash::show(latest_codex_exe(&root, cfg.use_current_junction));
+
+    dark_window::install();
     let ui = AppWindow::new()?;
-    center_window(&ui);
+    prepare_window(&ui);
     let cfg_for_launch = cfg.clone();
     // Bg thread writes `cfg_to_launch` into this shared Arc — without it,
     // a launcher-defer save would clobber the just-recorded Codex state.
@@ -175,14 +185,8 @@ fn run_proxy(
         root.clone(),
         forward.clone(),
     )?;
-    ui.window().hide()?; // ensure invisible until we explicitly show
-
-    // Optional artificial floor on splash visibility. Disabled (0) by default;
-    // set to a positive value if you want a deliberate "we're checking" pause.
-    const MIN_SPLASH_MS: u64 = 0;
 
     let ui_weak = ui.as_weak();
-    let splash_start = std::time::Instant::now();
     let cfg_shared_for_bg = cfg_shared.clone();
     std::thread::spawn(move || {
         let codex_decision = updater::check_auto(&cfg_for_check, store::PRODUCT_ID_CODEX);
@@ -195,16 +199,6 @@ fn run_proxy(
             persist_runtime_state(&cfg_for_launch, &root, &codex_decision, &launcher_decision);
         // Sync into the shared Mutex so UI callbacks save from current state.
         *cfg_shared_for_bg.lock().unwrap() = cfg_to_launch.clone();
-
-        #[allow(clippy::absurd_extreme_comparisons)]
-        {
-            if MIN_SPLASH_MS > 0 {
-                let elapsed = splash_start.elapsed().as_millis() as u64;
-                if elapsed < MIN_SPLASH_MS {
-                    std::thread::sleep(std::time::Duration::from_millis(MIN_SPLASH_MS - elapsed));
-                }
-            }
-        }
 
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -232,12 +226,14 @@ fn run_proxy(
                     ui.set_update_current_version(current.into());
                     ui.set_update_latest_version(latest.into());
                     ui.set_current_screen(12);
+                    drop(splash);
                     let _ = ui.show();
                 }
                 other => {
                     if let UpdateDecision::Error(e) = &other {
                         log_event(&format!("update check failed: {e}; launching anyway"));
                     }
+                    drop(splash);
                     if let Err(e) = proxy::launch(&root, &cfg_to_launch, &forward) {
                         let msg = format!("launch failed: {e:#}");
                         log_event(&msg);
@@ -260,10 +256,8 @@ fn run_proxy(
         });
     });
 
-    // Run the event loop without showing the window. Slint stays alive
-    // because the bg thread holds a reference; when it calls quit_event_loop
-    // (silent-launch path) or the user closes the prompt (Available path),
-    // we return.
+    // Slint event loop pumps the Slint window when shown; the splash runs
+    // its own message loop on a dedicated thread until dropped.
     slint::run_event_loop()?;
     Ok(())
 }
@@ -564,11 +558,13 @@ fn run_uninstall_ui() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    dark_window::install();
     let ui = AppWindow::new()?;
-    center_window(&ui);
+    prepare_window(&ui);
     wire_uninstall_ui(&ui, ctx)?;
     ui.set_current_screen(20);
-    ui.run()?;
+    show_when_ready(&ui);
+    slint::run_event_loop()?;
     Ok(())
 }
 
@@ -952,7 +948,11 @@ fn spawn_update_worker(ui_weak: slint::Weak<AppWindow>, cfg: Arc<Mutex<Config>>)
 /// which looks unfinished. We compute center from `GetSystemMetrics(SM_CX/CYSCREEN)`
 /// scaled by `GetDpiForSystem()` since our AppWindow is declared in logical
 /// pixels (580x420) and the screen metrics come back in physical.
-fn center_window(ui: &AppWindow) {
+/// Pre-show window setup: center and hide. Dark client area + dark title
+/// bar are handled before the window paints by the CBT hook from
+/// `dark_window::install`, which each AppWindow entry point invokes
+/// just before constructing the window.
+fn prepare_window(ui: &AppWindow) {
     use windows::Win32::UI::HiDpi::GetDpiForSystem;
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -969,6 +969,18 @@ fn center_window(ui: &AppWindow) {
         let y = ((screen_h - win_h) / 2).max(0);
         ui.window().set_position(slint::PhysicalPosition::new(x, y));
     }
+    let _ = ui.window().hide();
+}
+
+/// Schedule `ui.show()` once the event loop runs, so Slint's renderer has
+/// time to produce a first frame before the window becomes visible.
+fn show_when_ready(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = ui.show();
+        }
+    });
 }
 
 /// If any `Codex.exe` processes are running, prompt the user to terminate

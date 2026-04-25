@@ -133,6 +133,10 @@ export component AppWindow inherits Window {
     height: 420px;
     background: #1e1e2e;
     default-font-family: "Segoe UI";
+    // Launcher reminder is shown after Codex is launched/focused, which
+    // would otherwise bury it. Pin only on screen 30 so other screens
+    // behave normally.
+    always-on-top: current-screen == 30;
 
     VerticalBox {
         padding: 24px;
