@@ -13,7 +13,7 @@
 //! Shortcuts / registry / UAC elevation are intentionally NOT here — they
 //! live in their own modules alongside the rest of the Windows-integration goo.
 
-use crate::config::{Config, InstallMode, UpdatePolicy, CONFIG_FILENAME};
+use crate::config::{Config, InstallMode, UpdatePolicy};
 use crate::extract;
 use crate::junction;
 use crate::registry;
@@ -85,9 +85,12 @@ pub fn update(root: std::path::PathBuf, on_msg: impl Fn(InstallMsg) + Send + 'st
 }
 
 fn update_inner(root: &Path, on_msg: &dyn Fn(InstallMsg)) -> Result<String> {
-    let cfg_path = root.join(CONFIG_FILENAME);
-    let mut cfg = Config::load(&cfg_path)
-        .with_context(|| format!("loading existing config at {}", cfg_path.display()))?;
+    // load_runtime, not load — the per-user state overlay (System installs)
+    // holds runtime-current values like update_policy, skipped_version,
+    // launcher_suppress_until_unix. save_install below clears the overlay,
+    // so we must merge it in first or those choices vanish post-update.
+    let mut cfg = Config::load_runtime(root)
+        .with_context(|| format!("loading existing config at {}", root.display()))?;
 
     let downloads = root.join("downloads");
     std::fs::create_dir_all(&downloads)?;
@@ -140,7 +143,11 @@ fn update_inner(root: &Path, on_msg: &dyn Fn(InstallMsg)) -> Result<String> {
             .map(|d| d.as_secs())
             .unwrap_or(0),
     );
-    cfg.save(&cfg_path)?;
+    // Update flow is elevated for System (UAC re-spawn) and runs in user
+    // context for User/Portable, so install-root write is always available
+    // here. save_install also clears any stale per-user state overlay so
+    // the freshly-written install-root config takes effect on next launch.
+    cfg.save_install(root)?;
 
     // Refresh junction to point at the new version. If the user disabled it
     // mid-life, tear down any stale link left from a previous install.
@@ -258,7 +265,10 @@ fn run_inner(opts: &InstallOptions, on_msg: &dyn Fn(InstallMsg)) -> Result<Strin
         skipped_launcher_version: None,
         launcher_suppress_until_unix: None,
     };
-    cfg.save(&opts.root.join(CONFIG_FILENAME))?;
+    // Initial install runs elevated for System mode, so install-root
+    // write always succeeds. save_install also clears any stale state
+    // overlay from a previous install at this same root.
+    cfg.save_install(&opts.root)?;
 
     // --- 5. versions/current junction --------------------------------------
     if cfg.use_current_junction {

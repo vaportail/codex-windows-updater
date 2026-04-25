@@ -192,7 +192,7 @@ fn run_proxy(
         let launcher_decision = updater::check_launcher_auto(&cfg_for_check);
 
         let cfg_to_launch =
-            persist_runtime_state(&cfg_for_launch, &codex_decision, &launcher_decision);
+            persist_runtime_state(&cfg_for_launch, &root, &codex_decision, &launcher_decision);
         // Sync into the shared Mutex so UI callbacks save from current state.
         *cfg_shared_for_bg.lock().unwrap() = cfg_to_launch.clone();
 
@@ -699,6 +699,7 @@ fn wire_proxy_ui(
     {
         let ui_weak = ui.as_weak();
         let cfg = cfg.clone();
+        let root = root.clone();
         let pending_launch = pending_launch.clone();
         ui.on_request_check_updates(move || {
             // Explicit user action — no longer a launch-intent flow.
@@ -706,7 +707,7 @@ fn wire_proxy_ui(
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_current_screen(11);
             }
-            spawn_force_check(ui_weak.clone(), cfg.clone());
+            spawn_force_check(ui_weak.clone(), cfg.clone(), (*root).clone());
         });
     }
 
@@ -765,9 +766,7 @@ fn wire_proxy_ui(
             let cfg_snapshot = {
                 let mut c = cfg.lock().unwrap();
                 updater::apply_defer(&mut c, choice, &latest);
-                if let Ok(path) = mode::config_path() {
-                    let _ = c.save(&path);
-                }
+                let _ = c.save_runtime(&root);
                 c.clone()
             };
 
@@ -797,6 +796,7 @@ fn wire_proxy_ui(
     {
         let ui_weak = ui.as_weak();
         let cfg = cfg.clone();
+        let root = root.clone();
         ui.on_request_launcher_action(move |action_idx| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let action = int_to_launcher_choice(action_idx);
@@ -814,9 +814,7 @@ fn wire_proxy_ui(
             {
                 let mut c = cfg.lock().unwrap();
                 updater::apply_launcher_defer(&mut c, action, &latest);
-                if let Ok(path) = mode::config_path() {
-                    let _ = c.save(&path);
-                }
+                let _ = c.save_runtime(&root);
             }
 
             let _ = ui.window().hide();
@@ -858,17 +856,22 @@ fn wire_proxy_ui(
     Ok(cfg)
 }
 
-fn spawn_force_check(ui_weak: slint::Weak<AppWindow>, cfg: Arc<Mutex<Config>>) {
+fn spawn_force_check(
+    ui_weak: slint::Weak<AppWindow>,
+    cfg: Arc<Mutex<Config>>,
+    root: std::path::PathBuf,
+) {
     std::thread::spawn(move || {
         let snapshot = cfg.lock().unwrap().clone();
         let decision = updater::check_now(&snapshot, store::PRODUCT_ID_CODEX);
-        apply_update_decision(ui_weak, cfg, decision);
+        apply_update_decision(ui_weak, cfg, &root, decision);
     });
 }
 
 fn apply_update_decision(
     ui_weak: slint::Weak<AppWindow>,
     cfg: Arc<Mutex<Config>>,
+    install_root: &std::path::Path,
     decision: UpdateDecision,
 ) {
     // Persist last_check / known_latest for UpToDate + Available.
@@ -879,9 +882,7 @@ fn apply_update_decision(
         } => {
             let mut c = cfg.lock().unwrap();
             updater::record_check(&mut c, version);
-            if let Ok(path) = mode::config_path() {
-                let _ = c.save(&path);
-            }
+            let _ = c.save_runtime(install_root);
         }
         _ => {}
     }
@@ -1059,6 +1060,7 @@ fn open_url(url: &str) {
 /// updated Config; caller syncs it into the shared `Arc<Mutex<Config>>`.
 fn persist_runtime_state(
     base: &Config,
+    install_root: &std::path::Path,
     codex: &UpdateDecision,
     launcher: &updater::LauncherDecision,
 ) -> Config {
@@ -1087,9 +1089,7 @@ fn persist_runtime_state(
         _ => {}
     }
     if changed {
-        if let Ok(path) = mode::config_path() {
-            let _ = c.save(&path);
-        }
+        let _ = c.save_runtime(install_root);
     }
     c
 }

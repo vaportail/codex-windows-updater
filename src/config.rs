@@ -1,6 +1,6 @@
 use crate::store::Fetcher;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Filename of our config, placed next to the launcher exe.
 ///
@@ -110,4 +110,142 @@ impl Config {
         std::fs::write(path, raw)?;
         Ok(())
     }
+
+    /// Load runtime config. Always reads the install-root `updater.json`
+    /// first. For **System** installs, if a per-user state file exists
+    /// with a matching `install_root`, returns that instead — the state
+    /// file is the runtime-current view because the unelevated proxy
+    /// can't write back to Program Files. For Portable/User installs
+    /// the state file is never consulted (there's no permission gap to
+    /// bridge).
+    pub fn load_runtime(install_root: &Path) -> anyhow::Result<Self> {
+        let cfg = Self::load(&install_root.join(CONFIG_FILENAME))?;
+        if !matches!(cfg.install_mode, InstallMode::System) {
+            return Ok(cfg);
+        }
+        if let Some(state_path) = state_file_path() {
+            if state_path.exists() {
+                if let Ok(raw) = std::fs::read_to_string(&state_path) {
+                    if let Ok(state) = serde_json::from_str::<StateFile>(&raw) {
+                        if paths_equal(&state.install_root, install_root) {
+                            return Ok(state.config);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(cfg)
+    }
+
+    /// Save runtime config to the appropriate location for the install mode:
+    ///
+    /// - **Portable / User**: writes directly to `<root>/updater.json`. The
+    ///   install root is user-writable in both modes, so there's no fallback
+    ///   path. A failure here means something is genuinely wrong (read-only
+    ///   volume, AV, etc.) and is propagated.
+    ///
+    /// - **System**: writes to the per-user state file at
+    ///   `%LOCALAPPDATA%\codex-launcher\state.json`. The install-root config
+    ///   in `C:\Program Files\Codex` is fixed at install time (when the
+    ///   wizard ran elevated) and the unelevated proxy can't update it.
+    pub fn save_runtime(&self, install_root: &Path) -> anyhow::Result<()> {
+        match self.install_mode {
+            InstallMode::Portable | InstallMode::User => {
+                self.save(&install_root.join(CONFIG_FILENAME))
+            }
+            InstallMode::System => {
+                let state_path = state_file_path().ok_or_else(|| {
+                    anyhow::anyhow!("LOCALAPPDATA not set; cannot persist runtime state")
+                })?;
+                if let Some(parent) = state_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let raw = serde_json::to_string_pretty(&StateFile {
+                    install_root: install_root.to_path_buf(),
+                    config: self.clone(),
+                })?;
+                std::fs::write(&state_path, raw)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Save during install or update — contexts where the caller has
+    /// elevation (or doesn't need it). Always writes to the install-root
+    /// `updater.json` regardless of mode. For System installs, also
+    /// clears any stale per-user state file that matches this install
+    /// root: the freshly-written install-root config is now newer and
+    /// shouldn't be shadowed by a left-over state overlay.
+    pub fn save_install(&self, install_root: &Path) -> anyhow::Result<()> {
+        self.save(&install_root.join(CONFIG_FILENAME))?;
+        let _ = clear_state_file_if_ours(install_root);
+        Ok(())
+    }
+}
+
+/// Remove the per-user state file iff its embedded `install_root` matches.
+/// Returns `Ok(Some(path))` if a matching state file was deleted, `Ok(None)`
+/// if there was nothing to do (no LOCALAPPDATA, file missing, parse failure,
+/// or different install), `Err` only on actual delete failure.
+pub fn clear_state_file_if_ours(
+    install_root: &Path,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let Some(state_path) = state_file_path() else {
+        return Ok(None);
+    };
+    let Ok(raw) = std::fs::read_to_string(&state_path) else {
+        return Ok(None);
+    };
+    let Ok(state) = serde_json::from_str::<StateFile>(&raw) else {
+        return Ok(None);
+    };
+    if !paths_equal(&state.install_root, install_root) {
+        return Ok(None);
+    }
+    std::fs::remove_file(&state_path)?;
+    Ok(Some(state_path))
+}
+
+/// Per-user fallback state file shape. `install_root` is embedded so we
+/// can ignore stale state from a different install at the same machine.
+///
+/// TODO: currently the entire `Config` is serialized into the state file,
+/// meaning install-time fields (install_mode, keep_versions, fetcher,
+/// use_current_junction, register_uninstall) are also persisted and would
+/// override their install-root values on load. In practice this is benign
+/// — those fields don't change between writes — but if a future code path
+/// fat-fingers one of them at runtime, the state file becomes the
+/// authoritative answer. Tighten by splitting into a `RuntimeState`
+/// struct holding only mutable fields (current_version, update_policy,
+/// last_check_unix, suppress_until_unix, known_latest, skipped_version)
+/// and overlaying onto the install-root config at load time. Not urgent.
+#[derive(Debug, Serialize, Deserialize)]
+struct StateFile {
+    install_root: PathBuf,
+    config: Config,
+}
+
+fn state_file_path() -> Option<PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    Some(
+        PathBuf::from(base)
+            .join("codex-launcher")
+            .join("state.json"),
+    )
+}
+
+/// Best-effort path equality. Tries canonicalization first (resolves
+/// short names, junctions, case differences); falls back to a normalized
+/// lowercase string match if either side can't canonicalize.
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        return ca == cb;
+    }
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
 }
