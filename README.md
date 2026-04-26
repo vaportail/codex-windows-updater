@@ -5,6 +5,8 @@ Downloads the official Microsoft Store MSIX directly (or via `winget`),
 extracts it, and re-launches the newest version on demand. No Store app
 required.
 
+<img width="870" height="679" alt="screenshot" src="https://github.com/user-attachments/assets/f4b36a50-60ed-4136-8535-86302d9d6fd6" />
+
 ## TL;DR
 
 A single executable, `codex-launcher.exe`. It behaves as either:
