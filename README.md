@@ -1,5 +1,7 @@
 # codex-windows-updater
 
+NOTICE: recent Codex updates caused the Electron Codex app to mess with Start Menu shortcuts, and some other stuff that breaks auto updates. In addition to introdoucing some bugs. I will fix it when I have time.
+
 Unofficial Windows installer and updater for the **OpenAI Codex** desktop app.
 Downloads the official Microsoft Store MSIX directly (or via `winget`),
 extracts it, and re-launches the newest version on demand. No Store app
