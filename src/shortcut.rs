@@ -1,9 +1,10 @@
 //! Start Menu `.lnk` creation + refresh via `IShellLinkW` / `IPersistFile`.
 //!
 //! Target = `<root>\codex-launcher.exe` (stable path — shortcut survives
-//! version bumps). IconLocation points at a real `Codex.exe` so the Start
-//! Menu renders Codex's own icon. On update we rewrite the shortcut to
-//! retarget the icon at the newest version's `Codex.exe`.
+//! version bumps). IconLocation points at the real app shell (`ChatGPT.exe`
+//! or legacy `Codex.exe`) so the Start Menu renders the app's own icon. On
+//! update we rewrite the shortcut to retarget the icon at the newest
+//! version's shell.
 
 use crate::config::InstallMode;
 use anyhow::{Context, Result};

@@ -6,7 +6,7 @@
 //! metadata we don't need to run Codex standalone.
 //!
 //! Layout produced:
-//!   <install_root>/versions/<version>/Codex.exe
+//!   <install_root>/versions/<version>/ChatGPT.exe  (or Codex.exe on older builds)
 //!   <install_root>/versions/<version>/resources/app.asar
 //!   ...
 //!
@@ -106,11 +106,10 @@ pub fn extract_app(
         )
     })?;
 
-    let codex_exe = final_dir.join("Codex.exe");
-    if !codex_exe.exists() {
+    if crate::proxy::app_exe_in(&final_dir).is_none() {
         bail!(
-            "extracted tree has no Codex.exe at {} — MSIX layout changed?",
-            codex_exe.display()
+            "extracted tree has no ChatGPT.exe/Codex.exe under {} — MSIX layout changed?",
+            final_dir.display()
         );
     }
 

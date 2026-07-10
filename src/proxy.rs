@@ -1,4 +1,4 @@
-//! Proxy-mode runtime: resolve the newest installed Codex.exe (self-healing
+//! Proxy-mode runtime: resolve the newest installed app shell (self-healing
 //! the `versions/current` junction if needed) and spawn it with the caller's
 //! args + inherited env. We always spawn — Codex's own chromium-derived
 //! ProcessSingleton handles the "already running, focus instead" case via
@@ -6,10 +6,36 @@
 //! hidden message window so we can warn the user if a *foreign* Codex
 //! install is currently the lock holder (their window will get focused
 //! instead of ours).
+//!
+//! Mid-2026 OpenAI renamed the Electron shell from `Codex.exe` to
+//! `ChatGPT.exe` (Store product id and ProductName "Codex" unchanged).
+//! Older version trees only ship `Codex.exe`; newer ones ship `ChatGPT.exe`
+//! plus a leftover non-shell `Codex.exe`. Prefer `ChatGPT.exe` when both
+//! exist.
 
 use crate::config::Config;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+/// Electron shell filenames under `versions/<ver>/`, preferred first.
+pub const APP_EXE_CANDIDATES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
+
+/// Process image basenames (lowercase) used by the shell and its Chromium
+/// multi-process children. The CLI helper at `resources/codex.exe` also
+/// matches `codex.exe` — path filtering is still required for "ours" checks.
+const APP_PROCESS_NAMES: &[&str] = &["chatgpt.exe", "codex.exe"];
+
+/// Resolve the real Electron shell inside a single version directory.
+/// Prefers `ChatGPT.exe` over a co-located stub/legacy `Codex.exe`.
+pub fn app_exe_in(dir: &Path) -> Option<PathBuf> {
+    for name in APP_EXE_CANDIDATES {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
 
 /// Same self-heal as the installer Launch button — delegates to
 /// `main::latest_codex_exe` so the logic lives in one place.
@@ -113,15 +139,19 @@ pub fn find_singleton_holder(_user_data_dir: &Path) -> Option<SingletonHolder> {
     None
 }
 
-/// Spawn Codex.exe with forwarded args. Always spawns — Codex's own
+/// Spawn the app shell with forwarded args. Always spawns — Codex's own
 /// ProcessSingleton handles the "already running" case via pipe handoff,
 /// transferring focus to the lock-holder. Before spawning we check the
 /// singleton; if a *foreign* install holds it, we MessageBox the user so
 /// they understand why their click may surface that other install's window
 /// instead of ours.
 pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> {
-    let exe = resolve_codex_exe(root, cfg.use_current_junction)
-        .ok_or_else(|| anyhow::anyhow!("no installed Codex.exe found under {}", root.display()))?;
+    let exe = resolve_codex_exe(root, cfg.use_current_junction).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no installed ChatGPT.exe/Codex.exe found under {}",
+            root.display()
+        )
+    })?;
 
     if let Some(udd) = codex_user_data_dir() {
         if let Some(holder) = find_singleton_holder(&udd) {
@@ -163,11 +193,11 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
     Ok(())
 }
 
-/// Terminate every `Codex.exe` process whose image path is NOT under
+/// Terminate every app-shell process whose image path is NOT under
 /// `versions_root`. We confirm the holder is foreign first, then sweep
-/// every other Codex.exe (children share the same foreign image). Waits
-/// up to 5s per PID for exit so the new spawn doesn't race a still-alive
-/// holder.
+/// every other matching process (children share the same foreign image).
+/// Waits up to 5s per PID for exit so the new spawn doesn't race a
+/// still-alive holder.
 #[cfg(windows)]
 fn kill_foreign_codex(holder: &SingletonHolder, versions_root: &Path) {
     let mut to_kill = Vec::new();
@@ -206,11 +236,12 @@ fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
 #[cfg(not(windows))]
 fn kill_foreign_codex(_holder: &SingletonHolder, _versions_root: &Path) {}
 
-/// PIDs of every Codex-named process whose image is under `versions_root`
+/// PIDs of every app-shell process whose image is under `versions_root`
 /// (i.e. belongs to *this* install — main, renderers, GPU, utility, the
 /// lowercase CLI helper at `resources/codex.exe`, etc.). Used by the
-/// uninstaller to terminate only our processes, not foreign installs or
-/// unrelated `codex.exe` binaries.
+/// uninstaller / updater to terminate only our processes, not foreign
+/// installs, the Microsoft Store ChatGPT app, or unrelated `codex.exe`
+/// binaries.
 #[cfg(windows)]
 pub fn find_our_codex_pids(versions_root: &Path) -> Vec<u32> {
     find_codex_pids()
@@ -256,13 +287,18 @@ fn process_image_path(pid: u32) -> Option<PathBuf> {
     }
 }
 
-/// Walk the process table collecting PIDs of every process named `Codex.exe`.
-/// Electron apps fork multiple processes (main + renderer + GPU + utility),
-/// all typically sharing the same exe name — callers that intend to terminate
-/// Codex should kill every PID returned here, not just the first.
+/// Walk the process table collecting PIDs of every process named like the
+/// Electron shell (`ChatGPT.exe` or `Codex.exe`). Electron apps fork multiple
+/// processes (main + renderer + GPU + utility), all typically sharing the
+/// same exe name — callers that intend to terminate the app should kill every
+/// PID returned here, not just the first.
 ///
-/// We skip our own PID so a hypothetical rename of the launcher to Codex.exe
-/// wouldn't self-match.
+/// Prefer [`find_our_codex_pids`] when an install root is known: a system-wide
+/// match also hits the official Microsoft Store ChatGPT app and the CLI helper
+/// `resources/codex.exe`.
+///
+/// We skip our own PID so a hypothetical rename of the launcher wouldn't
+/// self-match.
 #[cfg(windows)]
 pub fn find_codex_pids() -> Vec<u32> {
     use windows::Win32::Foundation::CloseHandle;
@@ -271,7 +307,6 @@ pub fn find_codex_pids() -> Vec<u32> {
         TH32CS_SNAPPROCESS,
     };
 
-    let target = "codex.exe";
     let current_pid = std::process::id();
     let mut pids = Vec::new();
 
@@ -294,7 +329,7 @@ pub fn find_codex_pids() -> Vec<u32> {
                         .unwrap_or(entry.szExeFile.len());
                     let name =
                         String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase();
-                    if name == target {
+                    if APP_PROCESS_NAMES.iter().any(|t| name == *t) {
                         pids.push(entry.th32ProcessID);
                     }
                 }

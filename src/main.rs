@@ -137,7 +137,7 @@ fn run_proxy(
     if auto_update {
         // Defensive re-check after elevation: Codex may have been restarted
         // between the unelevated prompt and this re-spawn.
-        if !prompt_kill_codex_for("updating") {
+        if !prompt_kill_codex_for("updating", &root) {
             // User aborted at the elevated prompt. Fall through to normal
             // proxy flow so the update banner is still shown.
             dark_window::install();
@@ -753,7 +753,7 @@ fn wire_proxy_ui(
                 // on versions/<oldver>/Codex.exe etc. prevent clean junction
                 // swap and the running instance wouldn't pick up the new
                 // version anyway. Prompt before doing anything destructive.
-                if !prompt_kill_codex_for("updating") {
+                if !prompt_kill_codex_for("updating", root.as_path()) {
                     ui.set_current_screen(10);
                     return;
                 }
@@ -1118,15 +1118,19 @@ fn show_when_ready(ui: &AppWindow) {
     });
 }
 
-/// If any `Codex.exe` processes are running, prompt the user to terminate
-/// them. Returns true if it's safe to proceed (nothing was running, or user
+/// If any app-shell processes from *this* install are running, prompt the
+/// user to terminate them. Scoped to `install_root/versions` so we don't
+/// touch a Microsoft Store ChatGPT install or a foreign Codex tree.
+///
+/// Returns true if it's safe to proceed (nothing was running, or user
 /// confirmed termination and all PIDs exited). Returns false if the user
 /// cancelled, or if termination failed — caller should abort the destructive
 /// operation.
 ///
 /// `action` is the verb used in the prompt, e.g. "updating" / "uninstalling".
-fn prompt_kill_codex_for(action: &str) -> bool {
-    let pids = proxy::find_codex_pids();
+fn prompt_kill_codex_for(action: &str, install_root: &std::path::Path) -> bool {
+    let versions_root = install_root.join("versions");
+    let pids = proxy::find_our_codex_pids(&versions_root);
     if pids.is_empty() {
         return true;
     }
@@ -1142,7 +1146,7 @@ fn prompt_kill_codex_for(action: &str) -> bool {
         return false;
     }
     proxy::terminate_pids(&pids, 5000);
-    let still = proxy::find_codex_pids();
+    let still = proxy::find_our_codex_pids(&versions_root);
     if !still.is_empty() {
         dialogs::error(&format!(
             "Failed to terminate {} Codex process(es). Aborting.",
@@ -1297,17 +1301,21 @@ fn int_to_fetcher(i: i32) -> Fetcher {
     }
 }
 
-/// Resolve the Codex.exe to launch.
+/// Resolve the Electron shell (`ChatGPT.exe` preferred, else `Codex.exe`) to
+/// launch.
 ///
 /// When `use_junction` is true: scan for the newest numeric-version dir,
 /// verify the junction points at it (self-heal via remove+recreate if not),
-/// and return the junction path (`versions/current/Codex.exe`). Launching
+/// and return the junction path (`versions/current/<shell>.exe`). Launching
 /// via the stable junction path is what lets user-applied AV exclusions
 /// survive updates.
 ///
 /// When `use_junction` is false, or the junction can't be established,
-/// return the newest numeric-version `Codex.exe` directly.
-fn latest_codex_exe(root: &std::path::Path, use_junction: bool) -> Option<std::path::PathBuf> {
+/// return the newest numeric-version shell directly.
+pub(crate) fn latest_codex_exe(
+    root: &std::path::Path,
+    use_junction: bool,
+) -> Option<std::path::PathBuf> {
     let versions = root.join("versions");
     let (newest_name, newest_exe) = newest_numeric_version(&versions)?;
 
@@ -1334,16 +1342,15 @@ fn latest_codex_exe(root: &std::path::Path, use_junction: bool) -> Option<std::p
         }
     }
 
-    let via_junction = link.join("Codex.exe");
-    if via_junction.exists() {
+    if let Some(via_junction) = proxy::app_exe_in(&link) {
         Some(via_junction)
     } else {
         Some(newest_exe)
     }
 }
 
-/// Scan `versions/` for the highest numeric-dotted dir containing `Codex.exe`.
-/// Returns `(dir_name, full_path_to_Codex.exe)`.
+/// Scan `versions/` for the highest numeric-dotted dir containing a known
+/// app shell. Returns `(dir_name, full_path_to_shell_exe)`.
 fn newest_numeric_version(versions: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
     let mut best: Option<(Vec<u64>, String, std::path::PathBuf)> = None;
     for entry in std::fs::read_dir(versions).ok()? {
@@ -1359,13 +1366,12 @@ fn newest_numeric_version(versions: &std::path::Path) -> Option<(String, std::pa
             continue;
         }
         let parts: Vec<u64> = name.split('.').map(|p| p.parse().unwrap_or(0)).collect();
-        let codex = entry.path().join("Codex.exe");
-        if !codex.exists() {
+        let Some(exe) = proxy::app_exe_in(&entry.path()) else {
             continue;
-        }
+        };
         match &best {
-            None => best = Some((parts, name, codex)),
-            Some((cur, _, _)) if parts > *cur => best = Some((parts, name, codex)),
+            None => best = Some((parts, name, exe)),
+            Some((cur, _, _)) if parts > *cur => best = Some((parts, name, exe)),
             _ => {}
         }
     }
