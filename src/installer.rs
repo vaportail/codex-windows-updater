@@ -185,6 +185,10 @@ fn update_inner(root: &Path, on_msg: &dyn Fn(InstallMsg)) -> Result<String> {
         }
     }
 
+    if let Some(exe) = crate::proxy::resolve_codex_exe(root, cfg.use_current_junction) {
+        crate::protocol::check_and_report(&exe);
+    }
+
     let _ = extract::prune_versions(root, cfg.keep_versions);
     let _ = std::fs::remove_file(&result.msix_path);
 
@@ -307,6 +311,10 @@ fn run_inner(opts: &InstallOptions, on_msg: &dyn Fn(InstallMsg)) -> Result<Strin
         }
     }
 
+    if let Some(exe) = crate::proxy::resolve_codex_exe(&opts.root, cfg.use_current_junction) {
+        crate::protocol::check_and_report(&exe);
+    }
+
     // --- 7. Prune -----------------------------------------------------------
     let _ = extract::prune_versions(&opts.root, cfg.keep_versions);
 
@@ -354,8 +362,7 @@ fn write_shortcut(root: &Path, mode: InstallMode, version: &str) -> Result<()> {
     };
     let target = root.join("codex-launcher.exe");
     let ver_dir = root.join("versions").join(version);
-    let icon = crate::proxy::app_exe_in(&ver_dir)
-        .unwrap_or_else(|| ver_dir.join("ChatGPT.exe"));
+    let icon = crate::proxy::app_exe_in(&ver_dir).unwrap_or_else(|| ver_dir.join("ChatGPT.exe"));
     shortcut::create_or_update(&link, &target, &icon, "Codex (unofficial updater)", root)
 }
 
@@ -363,8 +370,7 @@ fn write_shortcut(root: &Path, mode: InstallMode, version: &str) -> Result<()> {
 fn write_registry(root: &Path, mode: InstallMode, version: &str) -> Result<()> {
     let launcher = root.join("codex-launcher.exe");
     let ver_dir = root.join("versions").join(version);
-    let icon = crate::proxy::app_exe_in(&ver_dir)
-        .unwrap_or_else(|| ver_dir.join("ChatGPT.exe"));
+    let icon = crate::proxy::app_exe_in(&ver_dir).unwrap_or_else(|| ver_dir.join("ChatGPT.exe"));
     let entry = registry::UninstallEntry {
         display_name: "Codex (unofficial updater)",
         display_version: version,

@@ -182,6 +182,8 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
         }
     }
 
+    crate::protocol::check_and_report(&exe);
+
     // Working dir = the versioned install dir so relative resource lookups
     // (Electron's default) resolve against the app root.
     let working_dir = exe.parent().unwrap_or(root);

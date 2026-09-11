@@ -13,6 +13,7 @@ mod junction;
 mod launcher_update;
 mod mode;
 mod path_dialog;
+mod protocol;
 mod proxy;
 mod registry;
 mod safety;
