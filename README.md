@@ -16,7 +16,8 @@ A single executable, `codex-launcher.exe`. It behaves as either:
 - **Installer** — when no `updater.json` sits next to it. Runs the wizard
   (mode → path → options → progress → done).
 - **Proxy** — when `updater.json` is present. Spawns the most recent
-  `Codex.exe` from `versions/<ver>/`, after an optional update check.
+  `ChatGPT.exe` (or legacy `Codex.exe`) from `versions/<ver>/`, after an
+  optional update check.
 
 Install layout:
 
@@ -136,7 +137,8 @@ Run `codex-launcher.exe --uninstall`. The flow:
 
 1. Validate the install root looks like ours (refuses to wipe a Desktop /
    Downloads / user-profile / Program Files / drive-root).
-2. Detect any running `Codex.exe` processes and prompt before terminating
+2. Detect any running `ChatGPT.exe`/`Codex.exe` processes from this install
+   and prompt before terminating
    them.
 3. Whitelist-delete only the things we placed: `versions/`, `downloads/`,
    `updater.json`, the Start Menu shortcut, the Add/Remove Programs

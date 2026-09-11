@@ -329,20 +329,24 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// (Re)create the Start Menu `.lnk` with icon pointing at this version's
-/// `Codex.exe`. No-op for Portable mode (link_path returns None).
+/// app shell. No-op for Portable mode (link_path returns None).
 fn write_shortcut(root: &Path, mode: InstallMode, version: &str) -> Result<()> {
     let Some(link) = shortcut::link_path(mode)? else {
         return Ok(());
     };
     let target = root.join("codex-launcher.exe");
-    let icon = root.join("versions").join(version).join("Codex.exe");
+    let ver_dir = root.join("versions").join(version);
+    let icon = crate::proxy::app_exe_in(&ver_dir)
+        .unwrap_or_else(|| ver_dir.join("ChatGPT.exe"));
     shortcut::create_or_update(&link, &target, &icon, "Codex (unofficial updater)", root)
 }
 
 /// (Re)write the Add/Remove Programs registry entry for the current install.
 fn write_registry(root: &Path, mode: InstallMode, version: &str) -> Result<()> {
     let launcher = root.join("codex-launcher.exe");
-    let icon = root.join("versions").join(version).join("Codex.exe");
+    let ver_dir = root.join("versions").join(version);
+    let icon = crate::proxy::app_exe_in(&ver_dir)
+        .unwrap_or_else(|| ver_dir.join("ChatGPT.exe"));
     let entry = registry::UninstallEntry {
         display_name: "Codex (unofficial updater)",
         display_version: version,
