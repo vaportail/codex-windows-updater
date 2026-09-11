@@ -77,7 +77,8 @@ pub fn extract_app(
         if rel.is_empty() {
             continue;
         }
-        let out_path = safe_join(&partial_dir, rel)?;
+        let decoded_rel = decode_package_path(rel)?;
+        let out_path = safe_join(&partial_dir, &decoded_rel)?;
 
         if entry.is_dir() {
             fs::create_dir_all(&out_path)?;
@@ -114,6 +115,38 @@ pub fn extract_app(
     }
 
     Ok(final_dir)
+}
+
+/// MSIX ZIP part names are URI-escaped. Decode each component exactly once,
+/// before safe_join validates the resulting filesystem path. Encoded separators
+/// must not turn one package component into multiple filesystem components.
+fn decode_package_path(name: &str) -> Result<String> {
+    let mut components = Vec::new();
+    for component in name.split('/') {
+        let mut decoded = Vec::with_capacity(component.len());
+        let mut bytes = component.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                let high = bytes.next().and_then(|b| (b as char).to_digit(16));
+                let low = bytes.next().and_then(|b| (b as char).to_digit(16));
+                match (high, low) {
+                    (Some(high), Some(low)) => decoded.push((high * 16 + low) as u8),
+                    _ => bail!("invalid percent escape in package path: {}", name),
+                }
+            } else {
+                decoded.push(byte);
+            }
+        }
+        let decoded = String::from_utf8(decoded).context("package path is not valid UTF-8")?;
+        if decoded.contains(['/', '\\', ':', '\0']) {
+            bail!(
+                "invalid separator or reserved character in package path: {}",
+                name
+            );
+        }
+        components.push(decoded);
+    }
+    Ok(components.join("/"))
 }
 
 /// Reject absolute paths, drive letters, and `..` traversal. ZIP entries
@@ -209,4 +242,98 @@ fn parse_version(s: &str) -> Vec<u64> {
     s.split('.')
         .map(|p| p.parse::<u64>().unwrap_or(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_encoded_package_entries_to_decoded_paths() -> Result<()> {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zip::write::SimpleFileOptions;
+
+        let root = std::env::temp_dir().join(format!(
+            "codex-extract-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let package = root.join("test.msix");
+            let mut archive = zip::ZipWriter::new(fs::File::create(&package)?);
+            for name in [
+                "app/Codex.exe",
+                "app/resources/node_modules/%40oai/cua/index.js",
+            ] {
+                archive.start_file(name, SimpleFileOptions::default())?;
+                archive.write_all(b"fixture")?;
+            }
+            archive.finish()?;
+            let installed = extract_app(&package, &root, "1.0", &mut |_, _| {})?;
+            assert_eq!(
+                fs::read(installed.join("resources/node_modules/@oai/cua/index.js"))?,
+                b"fixture"
+            );
+            assert!(!installed.join("resources/node_modules/%40oai").exists());
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result
+    }
+    #[test]
+    fn decodes_scoped_packages_and_bundled_dependency_paths() {
+        for (encoded, expected) in [
+            ("resources/node_modules/%40oai/cua/index.js", "resources/node_modules/@oai/cua/index.js"),
+            (".pnpm/%40rollup_plugin-typescript%4012.1.2_rollup%404.35.0_tslib%402.8.1_typescript%405.7.3/node_modules/tslib/tslib.es6.js",
+             ".pnpm/@rollup_plugin-typescript@12.1.2_rollup@4.35.0_tslib@2.8.1_typescript@5.7.3/node_modules/tslib/tslib.es6.js"),
+            ("assets/caf%C3%A9%20logo.png", "assets/caf\u{e9} logo.png"),
+        ] {
+            let decoded = decode_package_path(encoded).unwrap();
+            assert_eq!(decoded, expected);
+            assert_eq!(safe_join(Path::new("root"), &decoded).unwrap(), Path::new("root").join(expected));
+        }
+    }
+
+    #[test]
+    fn decodes_once_and_preserves_unescaped_names() {
+        assert_eq!(
+            decode_package_path("%2540oai/a+b.js").unwrap(),
+            "%40oai/a+b.js"
+        );
+        assert_eq!(
+            decode_package_path("plain/directory/").unwrap(),
+            "plain/directory/"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_escapes_and_invalid_utf8() {
+        for name in ["bad%", "bad%4", "bad%GG", "%FF"] {
+            assert!(decode_package_path(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn rejects_encoded_separators_and_windows_reserved_characters() {
+        for name in [
+            "a%2fb",
+            "a%5Cb",
+            "C%3A/file",
+            "file%00",
+            "file:stream",
+            "a\\b",
+        ] {
+            assert!(decode_package_path(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn validates_traversal_after_decoding() {
+        for name in ["%2e%2e/escape", "folder/%2E%2E/escape", "/absolute"] {
+            let decoded = decode_package_path(name).unwrap();
+            assert!(safe_join(Path::new("root"), &decoded).is_err(), "{name}");
+        }
+    }
 }
