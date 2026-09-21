@@ -1,5 +1,13 @@
 # codex-windows-updater
 
+---
+
+# NEW NOTICE : Newest Codex ChatGPT.exe for some reason tries to read package identity - which fails cause we don't use Microsoft Store. 
+
+I will try to add a launcher that hooks those functions, since everything else worked so far. Another option is unpack asar and find the genius code that crashes the program if no identity is found. If it's even there and not in native code. Whatever.
+
+---
+
 NOTICE: recent Codex updates caused the Electron Codex app to mess with Start Menu shortcuts, and some other stuff that breaks auto updates. In addition to introdoucing some bugs. I will fix it when I have time.
 
 Unofficial Windows installer and updater for the **OpenAI Codex** desktop app.
