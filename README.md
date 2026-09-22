@@ -18,7 +18,11 @@ required.
 The launcher renames `resources/native/windows-updater.node` to
 `windows-updater.broken` during extraction and before launch. This disables the
 native Store updater whose package-identity lookup can prevent unpackaged Codex
-from starting. Codex tolerates the missing addon; this launcher handles updates.
+from starting. By default, it installs our replacement sidecar so Codex's in-app
+update button invokes this launcher. Uncheck "Use this launcher for in-app Codex
+updates" during installation, or set `"native_updater_bridge": false` in
+`updater.json`, to keep the rename-only workaround. Close Codex before the next
+launcher run applies a changed setting. Older configs default to enabled.
 The executable and ASAR are unchanged, and no DLL injection is used. Existing
 installations need write access to their version directory for the first rename.
 
@@ -84,10 +88,15 @@ For a basic integrity check without `gh`, compare the SHA-256:
 Requires Rust 1.80+ and the MSVC toolchain on Windows.
 
 ```
-cargo build --release
+./build.ps1 -Release
 ```
 
 The output is `target/release/codex-launcher.exe`.
+
+The build script and release workflow always embed the sidecar. See
+[native updater bridge](NATIVE_UPDATER_BRIDGE.md) for its manifest-gate limitations
+and test instructions. Plain `cargo check` and debug builds remain available for
+development; release builds require the script so the sidecar cannot be omitted.
 
 ## Operation
 

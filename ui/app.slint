@@ -92,6 +92,7 @@ export component AppWindow inherits Window {
     in-out property <bool> create-shortcut: true;
     in-out property <bool> register-uninstall: true;
     in-out property <bool> use-current-junction: true;
+    in-out property <bool> native-updater-bridge: true;
     in-out property <int> keep-versions: 2;
     in-out property <int> fetcher: 0; // 0=direct 1=winget
 
@@ -260,7 +261,7 @@ export component AppWindow inherits Window {
 
             // Options
             if root.current-screen == 3 : VerticalBox {
-                spacing: 12px;
+                spacing: 8px;
                 Text { text: "Options"; color: #cdd6f4; font-size: 14px; }
 
                 CheckBox { text: "Create Start Menu shortcut"; checked <=> root.create-shortcut; }
@@ -271,6 +272,10 @@ export component AppWindow inherits Window {
                 CheckBox {
                     text: "Maintain versions/current junction (recommended)";
                     checked <=> root.use-current-junction;
+                }
+                CheckBox {
+                    text: "Use this launcher for in-app Codex updates";
+                    checked <=> root.native-updater-bridge;
                 }
 
                 HorizontalBox {

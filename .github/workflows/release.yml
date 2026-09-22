@@ -28,7 +28,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
-        run: cargo build --release
+        run: ./build.ps1 -Release
 
       - name: Stage artifact
         shell: pwsh

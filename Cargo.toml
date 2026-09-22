@@ -6,6 +6,15 @@ rust-version = "1.80"
 description = "Unofficial installer/updater for the Codex Windows app"
 license = "MIT"
 
+[workspace]
+members = ["native-updater"]
+default-members = ["."]
+resolver = "2"
+exclude = ["vendor/napi-sys"]
+
+[patch.crates-io]
+napi-sys = { path = "vendor/napi-sys" }
+
 [[bin]]
 name = "codex-launcher"
 path = "src/main.rs"

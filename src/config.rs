@@ -71,6 +71,9 @@ pub struct Config {
     /// reparse points.
     #[serde(default = "default_true")]
     pub use_current_junction: bool,
+    /// Route Codex's in-app update button through this launcher.
+    #[serde(default = "default_true")]
+    pub native_updater_bridge: bool,
     /// Whether the Add/Remove Programs registry entry exists. Update path
     /// uses this to know whether to refresh DisplayVersion / DisplayIcon.
     /// Off by default for Portable installs.
@@ -97,6 +100,18 @@ fn default_keep_versions() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+#[test]
+fn bridge_defaults_on_and_explicit_opt_out_survives_save() {
+    let legacy = r#"{"install_mode":"portable","current_version":"1.0.0"}"#;
+    let mut cfg: Config = serde_json::from_str(legacy).unwrap();
+    assert!(cfg.native_updater_bridge);
+    cfg.native_updater_bridge = false;
+    let saved = serde_json::to_string(&cfg).unwrap();
+    let restored: Config = serde_json::from_str(&saved).unwrap();
+    assert!(!restored.native_updater_bridge);
 }
 
 impl Config {
@@ -126,8 +141,11 @@ impl Config {
         if let Some(state_path) = state_file_path() {
             if state_path.exists() {
                 if let Ok(raw) = std::fs::read_to_string(&state_path) {
-                    if let Ok(state) = serde_json::from_str::<StateFile>(&raw) {
+                    if let Ok(mut state) = serde_json::from_str::<StateFile>(&raw) {
                         if paths_equal(&state.install_root, install_root) {
+                            // This changes shared files under the install root;
+                            // an older per-user cooldown cache must not override it.
+                            state.config.native_updater_bridge = cfg.native_updater_bridge;
                             return Ok(state.config);
                         }
                     }
