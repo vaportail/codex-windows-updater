@@ -95,6 +95,8 @@ pub fn extract_app(
         progress(done, Some(total_app_entries));
     }
 
+    disable_native_updater(&partial_dir)?;
+
     if final_dir.exists() {
         fs::remove_dir_all(&final_dir)
             .with_context(|| format!("removing old {}", final_dir.display()))?;
@@ -115,6 +117,37 @@ pub fn extract_app(
     }
 
     Ok(final_dir)
+}
+
+/// The native Store updater can throw "The process has no package identity"
+/// during bootstrap in an unpackaged install. Codex handles an absent addon,
+/// and this launcher already manages updates. Preserve its bytes under a name
+/// that Node's native-addon loader will not find.
+pub fn disable_native_updater(app_dir: &Path) -> Result<()> {
+    let source = app_dir.join("resources/native/windows-updater.node");
+    if !source.try_exists()? {
+        return Ok(());
+    }
+    let destination = source.with_file_name("windows-updater.broken");
+    // Do not overwrite an existing backup. A normal second launch is a no-op
+    // because the .node file is already absent.
+    if destination.try_exists()? {
+        if !source.try_exists()? {
+            return Ok(());
+        }
+        bail!(
+            "cannot disable native updater: both {} and {} exist",
+            source.display(),
+            destination.display()
+        );
+    }
+    match fs::rename(&source, &destination) {
+        Ok(()) => Ok(()),
+        // Another simultaneous launch may have completed the same rename.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && destination.is_file() => Ok(()),
+        Err(e) => Err(e)
+            .with_context(|| format!("renaming {} to {}", source.display(), destination.display())),
+    }
 }
 
 /// MSIX ZIP part names are URI-escaped. Decode each component exactly once,
@@ -266,6 +299,7 @@ mod tests {
             for name in [
                 "app/Codex.exe",
                 "app/resources/node_modules/%40oai/cua/index.js",
+                "app/resources/native/windows-updater.node",
             ] {
                 archive.start_file(name, SimpleFileOptions::default())?;
                 archive.write_all(b"fixture")?;
@@ -277,6 +311,13 @@ mod tests {
                 b"fixture"
             );
             assert!(!installed.join("resources/node_modules/%40oai").exists());
+            assert!(!installed
+                .join("resources/native/windows-updater.node")
+                .exists());
+            assert_eq!(
+                fs::read(installed.join("resources/native/windows-updater.broken"))?,
+                b"fixture"
+            );
             Ok(())
         })();
         fs::remove_dir_all(&root)?;

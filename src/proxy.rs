@@ -187,6 +187,7 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
     // Working dir = the versioned install dir so relative resource lookups
     // (Electron's default) resolve against the app root.
     let working_dir = exe.parent().unwrap_or(root);
+    crate::extract::disable_native_updater(working_dir)?;
     std::process::Command::new(&exe)
         .args(forward_args)
         .current_dir(working_dir)
