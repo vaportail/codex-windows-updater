@@ -15,6 +15,13 @@ Downloads the official Microsoft Store MSIX directly (or via `winget`),
 extracts it, and re-launches the newest version on demand. No Store app
 required.
 
+The launcher renames `resources/native/windows-updater.node` to
+`windows-updater.broken` during extraction and before launch. This disables the
+native Store updater whose package-identity lookup can prevent unpackaged Codex
+from starting. Codex tolerates the missing addon; this launcher handles updates.
+The executable and ASAR are unchanged, and no DLL injection is used. Existing
+installations need write access to their version directory for the first rename.
+
 <img width="609" height="475" alt="screenshot" src="https://github.com/user-attachments/assets/f4b36a50-60ed-4136-8535-86302d9d6fd6" />
 
 ## TL;DR
