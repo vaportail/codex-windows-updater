@@ -95,6 +95,22 @@ pub fn extract_app(
         progress(done, Some(total_app_entries));
     }
 
+    // Keep the original package identity, independently of any app-local manifest.
+    // Validate before replacing an installed version, so an unusable identity
+    // cannot be reported as a successful install.
+    {
+        let mut manifest = zip
+            .by_name("AppxManifest.xml")
+            .context("MSIX has no readable root AppxManifest.xml")?;
+        let manifest_path = partial_dir.join(".codex-package-manifest.xml");
+        let mut out = fs::File::create(&manifest_path)?;
+        io::copy(&mut manifest, &mut out)?;
+        drop(out);
+        #[cfg(windows)]
+        codex_package_identity::Identity::from_manifest(&manifest_path)
+            .context("MSIX package identity is invalid or unsupported")?;
+    }
+
     if final_dir.exists() {
         fs::remove_dir_all(&final_dir)
             .with_context(|| format!("removing old {}", final_dir.display()))?;
@@ -263,6 +279,9 @@ mod tests {
         let result = (|| -> Result<()> {
             let package = root.join("test.msix");
             let mut archive = zip::ZipWriter::new(fs::File::create(&package)?);
+            let manifest = include_bytes!("../compat/test-manifest.xml");
+            archive.start_file("AppxManifest.xml", SimpleFileOptions::default())?;
+            archive.write_all(manifest)?;
             for name in [
                 "app/Codex.exe",
                 "app/resources/node_modules/%40oai/cua/index.js",
@@ -277,6 +296,10 @@ mod tests {
                 b"fixture"
             );
             assert!(!installed.join("resources/node_modules/%40oai").exists());
+            assert_eq!(
+                fs::read(installed.join(".codex-package-manifest.xml"))?,
+                manifest
+            );
             Ok(())
         })();
         fs::remove_dir_all(&root)?;

@@ -12,6 +12,8 @@ mod installer;
 mod junction;
 mod launcher_update;
 mod mode;
+#[cfg(windows)]
+mod package_compat;
 mod path_dialog;
 mod protocol;
 mod proxy;
@@ -52,6 +54,26 @@ fn main() -> anyhow::Result<()> {
     // `eprintln!` is a no-op) leave a forensic trail. Only installs after
     // `--self-test` so the smoke-test path stays side-effect-free.
     install_panic_handler();
+
+    // Explicit diagnostic launch also supports older extracted installs whose
+    // original MSIX manifest wasn't retained by previous launcher versions.
+    #[cfg(windows)]
+    if args.iter().any(|a| a == "--launch-with-identity") {
+        let exe = parse_string_flag(&args, "--exe")
+            .ok_or_else(|| anyhow::anyhow!("--launch-with-identity requires --exe <path>"))?;
+        let manifest = parse_string_flag(&args, "--manifest")
+            .ok_or_else(|| anyhow::anyhow!("--launch-with-identity requires --manifest <path>"))?;
+        let forward = args
+            .iter()
+            .position(|a| a == "--")
+            .map(|i| &args[i + 1..])
+            .unwrap_or(&[]);
+        return package_compat::launch(
+            std::path::Path::new(&exe),
+            std::path::Path::new(&manifest),
+            forward,
+        );
+    }
 
     // Best-effort cleanup of a half-written `codex-launcher.new.exe` from a
     // prior interrupted self-update. `codex-launcher.old.exe` is preserved

@@ -29,13 +29,19 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: tests
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
+
+      - name: Package identity startup smoke test
+        run: ./compat/test-startup.ps1
 
       - name: release build
-        run: cargo build --release
+        run: ./build.ps1
+
+      - name: Bundled release identity smoke test
+        run: ./compat/test-bundle.ps1
 
   audit:
     runs-on: ubuntu-latest

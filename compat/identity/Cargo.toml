@@ -1,0 +1,10 @@
+[package]
+name = "codex-package-identity"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+anyhow = "1"
+quick-xml = "0.36"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_Packaging_Appx"] }

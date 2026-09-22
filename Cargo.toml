@@ -6,6 +6,11 @@ rust-version = "1.80"
 description = "Unofficial installer/updater for the Codex Windows app"
 license = "MIT"
 
+[workspace]
+members = ["compat/identity", "compat/shim", "compat/launcher", "compat/probe"]
+default-members = ["."]
+resolver = "2"
+
 [[bin]]
 name = "codex-launcher"
 path = "src/main.rs"
@@ -23,6 +28,8 @@ quick-xml = "0.36"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
+codex-identity-launcher = { path = "compat/launcher" }
+codex-package-identity = { path = "compat/identity" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Controls",

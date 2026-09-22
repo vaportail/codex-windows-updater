@@ -69,10 +69,42 @@ For a basic integrity check without `gh`, compare the SHA-256:
 Requires Rust 1.80+ and the MSVC toolchain on Windows.
 
 ```
-cargo build --release
+./build.ps1
 ```
 
-The output is `target/release/codex-launcher.exe`.
+The output is `target/release/codex-launcher.exe`, including the package-identity
+compatibility DLL. `./build.ps1 -Debug` builds the same bundle without release
+optimization. Plain `cargo build` remains available for development, but requires
+`cargo build -p codex-identity-shim` beside it to launch versions using the shim.
+
+### Package identity compatibility
+
+New installs retain the downloaded MSIX's original manifest as
+`.codex-package-manifest.xml` inside the extracted version directory. The launcher
+loads an embedded Rust DLL before the executable entry point, then releases the
+app only after the DLL confirms initialization. The DLL supplies manifest-derived
+identity to `windows-updater.node` and `windows-account.node`, including the WinRT
+`Package.Current.Id` path used by the 26.915.4065.0 startup bootstrap.
+
+Chromium's own package detection remains unchanged. The shim does not register a
+Windows package, grant Store entitlements, or implement package deployment. Its
+WinRT facade supports identity properties; unsupported package operations return
+normal COM errors. This fixes the observed identity lookup crash, not every API
+that requires real MSIX registration. A renamed addon or a different identity API
+in a future release may require extending the shim.
+
+Older extracted versions without the saved manifest keep the legacy launch path.
+Reinstall from the original MSIX to obtain its manifest. For diagnosis, set
+`CODEX_DISABLE_IDENTITY_SHIM=1` to bypass the shim, or `CODEX_IDENTITY_TRACE` to an
+absolute log file path to record patched-addon loads and identity queries.
+
+The embedded DLL is cached by SHA-256 under
+`%LOCALAPPDATA%/codex-launcher/identity-shims/`, allowing unelevated launches of
+System installs. The cache is shared between installs and is not removed by
+uninstalling one installation.
+
+See [compat/README.md](compat/README.md) for standalone testing and implementation
+details.
 
 ## Operation
 

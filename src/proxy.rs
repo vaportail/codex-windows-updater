@@ -184,6 +184,17 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
 
     crate::protocol::check_and_report(&exe);
 
+    #[cfg(windows)]
+    {
+        let manifest = exe
+            .parent()
+            .unwrap_or(root)
+            .join(".codex-package-manifest.xml");
+        if manifest.is_file() && std::env::var_os("CODEX_DISABLE_IDENTITY_SHIM").is_none() {
+            return crate::package_compat::launch(&exe, &manifest, forward_args);
+        }
+    }
+
     // Working dir = the versioned install dir so relative resource lookups
     // (Electron's default) resolve against the app root.
     let working_dir = exe.parent().unwrap_or(root);
