@@ -2,7 +2,7 @@
 
 ---
 
-# NEW NOTICE : Newest Codex ChatGPT.exe for some reason tries to read package identity - which fails cause we don't use Microsoft Store. 
+# NEW NOTICE : Newest Codex ChatGPT.exe for some reason tries to read package identity - ~which fails cause we don't use Microsoft Store.~ - we rename the side-car from .node to .broken to prevent that
 
 I will try to add a launcher that hooks those functions, since everything else worked so far. Another option is unpack asar and find the genius code that crashes the program if no identity is found. If it's even there and not in native code. Whatever.
 
