@@ -35,6 +35,7 @@ pub struct InstallOptions {
     pub fetcher: Fetcher,
     /// Create `versions/current` junction pointing at the newest install.
     pub use_current_junction: bool,
+    pub native_updater_bridge: bool,
     /// For LocalFile fetcher — user-supplied MSIX path. Ignored otherwise.
     pub local_msix: Option<PathBuf>,
 }
@@ -128,7 +129,7 @@ fn update_inner(root: &Path, on_msg: &dyn Fn(InstallMsg)) -> Result<String> {
     on_msg(InstallMsg::Progress(Some(0.0)));
 
     let boxed = BoxedFn(on_msg);
-    extract::extract_app(
+    let app_dir = extract::extract_app(
         &result.msix_path,
         root,
         &result.version,
@@ -136,6 +137,8 @@ fn update_inner(root: &Path, on_msg: &dyn Fn(InstallMsg)) -> Result<String> {
             boxed.progress_entries(done, total);
         },
     )?;
+
+    crate::native_bridge::prepare(&app_dir, cfg.native_updater_bridge)?;
 
     on_msg(InstallMsg::Phase {
         phase: "Finalizing".into(),
@@ -249,7 +252,7 @@ fn run_inner(opts: &InstallOptions, on_msg: &dyn Fn(InstallMsg)) -> Result<Strin
     on_msg(InstallMsg::Progress(Some(0.0)));
 
     let on_msg_clone = BoxedFn(on_msg);
-    extract::extract_app(
+    let app_dir = extract::extract_app(
         &result.msix_path,
         &opts.root,
         &result.version,
@@ -257,6 +260,8 @@ fn run_inner(opts: &InstallOptions, on_msg: &dyn Fn(InstallMsg)) -> Result<Strin
             on_msg_clone.progress_entries(done, total);
         },
     )?;
+
+    crate::native_bridge::prepare(&app_dir, opts.native_updater_bridge)?;
 
     // --- 3. Place launcher stub --------------------------------------------
     on_msg(InstallMsg::Phase {
@@ -282,6 +287,7 @@ fn run_inner(opts: &InstallOptions, on_msg: &dyn Fn(InstallMsg)) -> Result<Strin
             f => f,
         },
         use_current_junction: opts.use_current_junction,
+        native_updater_bridge: opts.native_updater_bridge,
         register_uninstall: opts.register_uninstall,
         known_latest_launcher: None,
         skipped_launcher_version: None,

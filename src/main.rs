@@ -12,6 +12,7 @@ mod installer;
 mod junction;
 mod launcher_update;
 mod mode;
+mod native_bridge;
 mod path_dialog;
 mod protocol;
 mod proxy;
@@ -46,6 +47,16 @@ fn main() -> anyhow::Result<()> {
     // it in.
     if args.iter().any(|a| a == "--self-test") {
         return Ok(());
+    }
+    if args.iter().any(|a| a == "--bridge-check") {
+        return native_bridge::check();
+    }
+    if args.iter().any(|a| a == "--bridge-install") {
+        let result = native_bridge::install();
+        if let Err(error) = &result {
+            dialogs::error(&format!("Could not start the Codex update.\n\n{error:#}"));
+        }
+        return result;
     }
 
     // Capture panics to the per-user log so GUI-subsystem builds (where
@@ -348,6 +359,7 @@ fn parse_auto_install(args: &[String]) -> Option<AutoInstall> {
             keep_versions,
             fetcher,
             use_current_junction,
+            native_updater_bridge: !args.iter().any(|a| a == "--no-native-updater-bridge"),
             local_msix: None,
         },
     })
@@ -387,7 +399,37 @@ fn auto_install_args(opts: &InstallOptions) -> String {
     if !opts.use_current_junction {
         s.push_str(" --no-junction");
     }
+    if !opts.native_updater_bridge {
+        s.push_str(" --no-native-updater-bridge");
+    }
     s
+}
+
+#[cfg(test)]
+#[test]
+fn installer_bridge_option_survives_elevation_arguments() {
+    let base: Vec<String> = ["--auto-install", "--mode", "system", "--path", "C:\\Codex"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut opts = parse_auto_install(&base).unwrap().opts;
+    assert!(opts.native_updater_bridge);
+    for enabled in [false, true] {
+        opts.native_updater_bridge = enabled;
+        let serialized = auto_install_args(&opts);
+        // This fixture path contains no spaces; production uses Windows quoting.
+        let args: Vec<String> = serialized
+            .split_whitespace()
+            .map(|s| s.trim_matches('"').to_owned())
+            .collect();
+        assert_eq!(
+            parse_auto_install(&args)
+                .unwrap()
+                .opts
+                .native_updater_bridge,
+            enabled
+        );
+    }
 }
 
 fn wire_installer_ui(
@@ -425,6 +467,11 @@ fn wire_installer_ui(
         auto.as_ref()
             .map(|a| a.opts.register_uninstall)
             .unwrap_or(!portable_default),
+    );
+    ui.set_native_updater_bridge(
+        auto.as_ref()
+            .map(|a| a.opts.native_updater_bridge)
+            .unwrap_or(true),
     );
     ui.set_use_current_junction(
         auto.as_ref()
@@ -506,6 +553,7 @@ fn wire_installer_ui(
                 keep_versions: ui.get_keep_versions() as u32,
                 fetcher: int_to_fetcher(ui.get_fetcher()),
                 use_current_junction: use_junction,
+                native_updater_bridge: ui.get_native_updater_bridge(),
                 register_uninstall: ui.get_register_uninstall(),
                 known_latest_launcher: None,
                 skipped_launcher_version: None,
@@ -536,6 +584,7 @@ fn wire_installer_ui(
                 keep_versions: ui.get_keep_versions() as u32,
                 fetcher: int_to_fetcher(ui.get_fetcher()),
                 use_current_junction: ui.get_use_current_junction(),
+                native_updater_bridge: ui.get_native_updater_bridge(),
                 local_msix: None,
             };
 

@@ -187,9 +187,13 @@ pub fn launch(root: &Path, cfg: &Config, forward_args: &[String]) -> Result<()> 
     // Working dir = the versioned install dir so relative resource lookups
     // (Electron's default) resolve against the app root.
     let working_dir = exe.parent().unwrap_or(root);
-    crate::extract::disable_native_updater(working_dir)?;
+    crate::native_bridge::prepare(working_dir, cfg.native_updater_bridge)?;
     std::process::Command::new(&exe)
         .args(forward_args)
+        .env(
+            "CODEX_UPDATER_LAUNCHER",
+            crate::native_bridge::launcher_for(root)?,
+        )
         .current_dir(working_dir)
         .spawn()
         .with_context(|| format!("spawning {}", exe.display()))?;

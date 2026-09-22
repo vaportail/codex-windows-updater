@@ -29,13 +29,24 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: tests
         run: cargo test --all-targets
 
       - name: release build
-        run: cargo build --release
+        run: ./build.ps1 -Release
+
+      - name: Native bridge contract
+        shell: pwsh
+        run: |
+          cargo build -p codex-native-updater --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc tests/bridge-helper.rs -o target/bridge-test-helper.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node tests/native-updater.cjs target/debug/codex_native_updater.dll target/bridge-test-helper.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node tests/launcher-bridge.cjs target/release/codex-launcher.exe
 
   audit:
     runs-on: ubuntu-latest
